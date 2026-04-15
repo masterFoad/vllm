@@ -31,6 +31,33 @@ class InputBuffers:
             max_num_reqs, dtype=torch.int32, device=device
         )
 
+        # Persistent CPU/GPU buffers for prepare_inputs
+        self.idx_mapping_np = np.empty(max_num_reqs, dtype=np.int32)
+        self.idx_mapping = torch.empty(max_num_reqs, dtype=torch.int32, device=device)
+
+        self.cu_num_logits_np = np.empty(max_num_reqs + 1, dtype=np.int32)
+        self.cu_num_logits = torch.empty(
+            max_num_reqs + 1, dtype=torch.int32, device=device
+        )
+
+        self.query_start_loc_np = np.empty(max_num_reqs + 1, dtype=np.int32)
+
+        self.expanded_idx_mapping = torch.empty(
+            max_num_tokens, dtype=torch.int32, device=device
+        )
+        self.expanded_local_pos = torch.empty(
+            max_num_tokens, dtype=torch.int32, device=device
+        )
+
+        # Prebuilt arange buffer for common case (no draft tokens)
+        self.arange_num_reqs = torch.arange(
+            max_num_reqs + 1, dtype=torch.int32, device=device
+        )
+        self.arange_num_reqs_np = np.arange(max_num_reqs + 1, dtype=np.int32)
+        self.zeros_num_reqs = torch.zeros(
+            max_num_reqs, dtype=torch.int32, device=device
+        )
+
 
 @dataclass
 class InputBatch:
@@ -85,13 +112,12 @@ class InputBatch:
         input_buffers: InputBuffers,
     ) -> "InputBatch":
         assert 0 < num_reqs <= num_tokens
-        device = input_buffers.device
 
         req_ids = [f"req_{i}_{random_uuid()}" for i in range(num_reqs)]
-        idx_mapping_np = np.arange(num_reqs, dtype=np.int32)
-        idx_mapping = torch.arange(num_reqs, dtype=torch.int32, device=device)
+        idx_mapping_np = input_buffers.arange_num_reqs_np[:num_reqs]
+        idx_mapping = input_buffers.arange_num_reqs[:num_reqs]
         expanded_idx_mapping = idx_mapping
-        expanded_local_pos = torch.zeros(num_reqs, dtype=torch.int32, device=device)
+        expanded_local_pos = input_buffers.zeros_num_reqs[:num_reqs]
 
         num_scheduled_tokens = np.full(num_reqs, num_tokens // num_reqs, dtype=np.int32)
         num_scheduled_tokens[-1] += num_tokens % num_reqs
@@ -104,7 +130,7 @@ class InputBatch:
         input_buffers.seq_lens[num_reqs:] = 0
         seq_lens = input_buffers.seq_lens[:num_reqs]
 
-        query_start_loc_np = np.empty(num_reqs + 1, dtype=np.int32)
+        query_start_loc_np = input_buffers.query_start_loc_np[: num_reqs + 1]
         query_start_loc_np[0] = 0
         np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1:])
         input_buffers.query_start_loc[:1] = 0
@@ -119,8 +145,8 @@ class InputBatch:
         positions = input_buffers.positions[:num_tokens].zero_()
 
         logits_indices = query_start_loc[1:] - 1
-        cu_num_logits = torch.arange(num_reqs + 1, device=device, dtype=torch.int32)
-        cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
+        cu_num_logits = input_buffers.arange_num_reqs[: num_reqs + 1]
+        cu_num_logits_np = input_buffers.arange_num_reqs_np[: num_reqs + 1]
         return cls(
             req_ids=req_ids,
             num_reqs=num_reqs,
@@ -560,17 +586,17 @@ def expand_idx_mapping(
     total_num_logits: int,
     cu_num_logits: torch.Tensor,
     max_expand_len: int,
+    expanded_idx_mapping: torch.Tensor,
+    expanded_local_pos: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_reqs = idx_mapping.shape[0]
-    expanded_idx_mapping = idx_mapping.new_empty(total_num_logits)
-    expanded_local_pos = torch.empty(
-        total_num_logits, dtype=torch.int32, device=idx_mapping.device
-    )
+    expanded_idx_mapping_slice = expanded_idx_mapping[:total_num_logits]
+    expanded_local_pos_slice = expanded_local_pos[:total_num_logits]
     _expand_idx_mapping_kernel[(num_reqs,)](
         idx_mapping,
-        expanded_idx_mapping,
-        expanded_local_pos,
+        expanded_idx_mapping_slice,
+        expanded_local_pos_slice,
         cu_num_logits,
         BLOCK_SIZE=triton.next_power_of_2(max_expand_len),
     )
-    return expanded_idx_mapping, expanded_local_pos
+    return expanded_idx_mapping_slice, expanded_local_pos_slice
