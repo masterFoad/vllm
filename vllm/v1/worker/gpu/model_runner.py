@@ -784,6 +784,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.draft_tokens,
             cu_num_logits,
             total_num_logits,
+            self.input_buffers.logits_indices,
         )
 
         return InputBatch(
@@ -878,6 +879,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.cu_num_logits,
             input_batch.idx_mapping,
             self.req_states.prefill_len.gpu,
+            self.input_buffers.num_rejected,
         )
         return sampler_output, num_sampled, num_rejected
 

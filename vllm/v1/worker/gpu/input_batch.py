@@ -49,6 +49,11 @@ class InputBuffers:
             max_num_tokens, dtype=torch.int32, device=device
         )
 
+        self.logits_indices = torch.empty(
+            max_num_tokens, dtype=torch.int64, device=device
+        )
+        self.num_rejected = torch.empty(max_num_reqs, dtype=torch.int32, device=device)
+
         # Prebuilt arange buffer for common case (no draft tokens)
         self.arange_num_reqs = torch.arange(
             max_num_reqs + 1, dtype=torch.int32, device=device
@@ -357,16 +362,13 @@ def combine_sampled_and_draft_tokens(
     draft_tokens: torch.Tensor,
     cu_num_logits: torch.Tensor,
     num_logits: int,
+    logits_indices: torch.Tensor,
 ) -> torch.Tensor:
     # use idx_mapping.shape[0] for actual request count
     num_reqs = idx_mapping.shape[0]
     num_speculative_steps = draft_tokens.shape[-1]
 
-    logits_indices = torch.empty(
-        num_logits,
-        dtype=torch.int64,
-        device=input_ids.device,
-    )
+    logits_indices_slice = logits_indices[:num_logits]
     _combine_sampled_and_draft_tokens_kernel[(num_reqs,)](
         input_ids,
         idx_mapping,
@@ -377,12 +379,12 @@ def combine_sampled_and_draft_tokens(
         draft_tokens,
         draft_tokens.stride(0),
         cu_num_logits,
-        logits_indices,
+        logits_indices_slice,
         # NOTE(woosuk): Add 1 to ensure the block can cover the last sampled token
         # in addition to all draft tokens.
         BLOCK_SIZE=triton.next_power_of_2(num_speculative_steps + 1),
     )
-    return logits_indices
+    return logits_indices_slice
 
 
 @triton.jit
@@ -420,18 +422,19 @@ def get_num_sampled_and_rejected(
     cu_num_logits: torch.Tensor,
     idx_mapping: torch.Tensor,
     prefill_len: torch.Tensor,
+    num_rejected: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_reqs = idx_mapping.shape[0]
-    num_rejected = torch.empty_like(num_sampled)
+    num_rejected_slice = num_rejected[:num_reqs]
     _get_num_sampled_and_rejected_kernel[(num_reqs,)](
         num_sampled,
-        num_rejected,
+        num_rejected_slice,
         seq_lens,
         cu_num_logits,
         idx_mapping,
         prefill_len,
     )
-    return num_sampled, num_rejected
+    return num_sampled, num_rejected_slice
 
 
 @triton.jit
