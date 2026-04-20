@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from abc import ABC, abstractmethod
 from collections.abc import Iterable, Sequence
 from functools import partial
 
@@ -21,11 +22,13 @@ def async_copy_to_gpu(
 ) -> torch.Tensor:
     if isinstance(x, np.ndarray):
         x = torch.from_numpy(x)
-    assert x.is_cpu
 
     if out is None:
         assert device is not None
         out = torch.empty_like(x, device=device)
+
+    if x.device == out.device:
+        return out.copy_(x)
 
     # Copy directly to GPU — explicit pin_memory() causes sporadic stalls
     # under high concurrency due to CUDA driver contention. The driver
@@ -98,7 +101,32 @@ class UvaBackedTensor:
         return self.gpu
 
 
-class StagedWriteTensor:
+class StagedWriteTensor(ABC):
+    @abstractmethod
+    def stage_write(
+        self, index: int, start: int, x: Iterable[int] | Iterable[float]
+    ) -> None:
+        pass
+
+    @abstractmethod
+    def stage_write_elem(self, index: int, x: int) -> None:
+        pass
+
+    @abstractmethod
+    def apply_write(self) -> None:
+        pass
+
+    @abstractmethod
+    def clear_staged_writes(self) -> None:
+        pass
+
+    @property
+    @abstractmethod
+    def gpu(self) -> torch.Tensor:
+        pass
+
+
+class CUDAStagedWriteTensor(StagedWriteTensor):
     def __init__(
         self,
         size: int | Sequence[int],
@@ -119,12 +147,12 @@ class StagedWriteTensor:
 
         if not uva_instead_of_gpu:
             # Create a GPU tensor (default)
-            self.gpu = torch.zeros(size, dtype=dtype, device=device)
+            self._gpu = torch.zeros(size, dtype=dtype, device=device)
         else:
             # For a large but not-frequently-accessed tensor, we can use UVA instead of
             # GPU to save GPU memory
             self._uva_buf = UvaBuffer(size, dtype)
-            self.gpu = self._uva_buf.uva
+            self._gpu = self._uva_buf.uva
 
         self._staged_write_indices: list[int] = []
         self._staged_write_starts: list[int] = []
@@ -136,6 +164,10 @@ class StagedWriteTensor:
         self.write_indices = new_buffer(self.num_rows, dtype=torch.int32)
         self.write_starts = new_buffer(self.num_rows, dtype=torch.int32)
         self.write_cu_lens = new_buffer(self.num_rows, dtype=torch.int32)
+
+    @property
+    def gpu(self) -> torch.Tensor:
+        return self._gpu
 
     def stage_write(
         self, index: int, start: int, x: Iterable[int] | Iterable[float]
@@ -172,8 +204,8 @@ class StagedWriteTensor:
 
         # Write diffs to the GPU buffer
         _apply_write_kernel[(n,)](
-            self.gpu,
-            self.gpu.stride(0),
+            self._gpu,
+            self._gpu.stride(0),
             indices_uva,
             starts_uva,
             write_contents,
@@ -188,6 +220,74 @@ class StagedWriteTensor:
         self._staged_write_starts.clear()
         self._staged_write_contents.clear()
         self._staged_write_cu_lens.clear()
+
+
+class CPUStagedWriteTensor(StagedWriteTensor):
+    def __init__(
+        self,
+        size: int | Sequence[int],
+        dtype: torch.dtype,
+        device: torch.device,
+    ):
+        self.size = size
+        self.dtype = dtype
+        self.device = device
+        self._gpu = torch.zeros(size, dtype=dtype, device=device)
+        self._staged_writes: list[tuple[int, int, list]] = []
+
+    @property
+    def gpu(self) -> torch.Tensor:
+        return self._gpu
+
+    def stage_write(
+        self, index: int, start: int, x: Iterable[int] | Iterable[float]
+    ) -> None:
+        if not x:
+            return
+        # Use list.append() for fast staging
+        self._staged_writes.append((index, start, list(x)))
+
+    def stage_write_elem(self, index: int, x: int) -> None:
+        self._staged_writes.append((index, 0, [x]))
+
+    def apply_write(self) -> None:
+        if not self._staged_writes:
+            return
+        for index, start, x in self._staged_writes:
+            n = len(x)
+            if self._gpu.ndim == 1:
+                # For 1D tensors (e.g. total_len, num_computed_tokens)
+                # index is the position, start is ignored
+                self._gpu[index] = x[0]
+            else:
+                # For 2D tensors (e.g. all_token_ids, block_tables)
+                self._gpu[index, start : start + n] = torch.tensor(
+                    x, dtype=self.dtype, device=self.device
+                )
+        self.clear_staged_writes()
+
+    def clear_staged_writes(self) -> None:
+        self._staged_writes.clear()
+
+
+class DeviceMemoryManager:
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.is_cpu = device.type == "cpu"
+
+    def get_staged_writer(
+        self,
+        size: int | Sequence[int],
+        dtype: torch.dtype,
+        max_concurrency: int = 2,
+        uva_instead_of_gpu: bool = False,
+    ) -> StagedWriteTensor:
+        if self.is_cpu:
+            return CPUStagedWriteTensor(size, dtype, self.device)
+        else:
+            return CUDAStagedWriteTensor(
+                size, dtype, self.device, max_concurrency, uva_instead_of_gpu
+            )
 
 
 @triton.jit
