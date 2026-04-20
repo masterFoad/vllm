@@ -3,7 +3,10 @@
 import numpy as np
 import torch
 
-from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
+from vllm.v1.worker.gpu.buffer_utils import (
+    DeviceMemoryManager,
+    UvaBackedTensor,
+)
 
 
 class RequestState:
@@ -15,6 +18,7 @@ class RequestState:
         num_speculative_steps: int,
         vocab_size: int,
         device: torch.device,
+        memory_manager: DeviceMemoryManager | None = None,
     ):
         self.max_num_reqs = max_num_reqs
         self.max_model_len = max_model_len
@@ -22,6 +26,7 @@ class RequestState:
         self.num_speculative_steps = num_speculative_steps
         self.vocab_size = vocab_size
         self.device = device
+        self.memory_manager = memory_manager or DeviceMemoryManager(device)
 
         self.req_id_to_index: dict[str, int] = {}
         self.index_to_req_id: dict[int, str] = {}
@@ -30,10 +35,9 @@ class RequestState:
         # NOTE(woosuk): This tensor can be extremely large (e.g., several GBs)
         # depending on the configured max_num_reqs and max_model_len.
         # To save GPU memory, we use UVA instead of GPU for this tensor.
-        self.all_token_ids = StagedWriteTensor(
+        self.all_token_ids = self.memory_manager.get_staged_writer(
             (self.max_num_reqs, self.max_model_len),
             dtype=torch.int32,
-            device=device,
             uva_instead_of_gpu=True,
         )
         # NOTE(woosuk): Distinguish clearly between prompt_len and prefill_len:
@@ -48,14 +52,14 @@ class RequestState:
         self.prompt_len = UvaBackedTensor(self.max_num_reqs, dtype=torch.int32)
         self.prefill_len = UvaBackedTensor(self.max_num_reqs, dtype=torch.int32)
         # total_len = prompt_len + output_len. It grows as the request progresses.
-        self.total_len = StagedWriteTensor(
-            self.max_num_reqs, dtype=torch.int32, device=device
+        self.total_len = self.memory_manager.get_staged_writer(
+            self.max_num_reqs, dtype=torch.int32
         )
 
         # Number of computed tokens.
         self.num_computed_prefill_tokens = np.zeros(self.max_num_reqs, dtype=np.int32)
-        self.num_computed_tokens = StagedWriteTensor(
-            self.max_num_reqs, dtype=torch.int32, device=device
+        self.num_computed_tokens = self.memory_manager.get_staged_writer(
+            self.max_num_reqs, dtype=torch.int32
         )
         # Optimistic CPU mirror of num_computed_tokens (upper bound on GPU value).
         self.num_computed_tokens_np = np.zeros(self.max_num_reqs, dtype=np.int32)

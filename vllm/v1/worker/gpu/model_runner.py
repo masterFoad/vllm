@@ -57,7 +57,10 @@ from vllm.v1.worker.gpu.attn_utils import (
     init_kv_cache,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
+from vllm.v1.worker.gpu.buffer_utils import (
+    DeviceMemoryManager,
+    async_copy_to_gpu,
+)
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
@@ -186,6 +189,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.pooling_runner: PoolingRunner | None = None
 
         # General request states.
+        self.memory_manager = DeviceMemoryManager(self.device)
         self.req_states = RequestState(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
@@ -193,6 +197,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_speculative_steps=self.num_speculative_steps,
             vocab_size=self.vocab_size,
             device=self.device,
+            memory_manager=self.memory_manager,
         )
         self.input_buffers = InputBuffers(
             max_num_reqs=self.max_num_reqs,
@@ -359,6 +364,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cp_size=self.dcp_size,
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
+            memory_manager=self.memory_manager,
         )
 
         self.attn_backends, self.attn_groups, attn_cg_support = init_attn_backend(
@@ -710,8 +716,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_scheduled_tokens = np.fromiter(numtoks_iter, dtype=np.int32, count=num_reqs)
 
         idx_mapping_iter = map(self.req_states.req_id_to_index.get, req_ids)
-        idx_mapping_np = np.fromiter(idx_mapping_iter, dtype=np.int32, count=num_reqs)
-        idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
+        idx_mapping_np = self.input_buffers.idx_mapping_np[:num_reqs]
+        for i, idx in enumerate(idx_mapping_iter):
+            idx_mapping_np[i] = idx
+        idx_mapping = self.input_buffers.idx_mapping[:num_reqs]
+        async_copy_to_gpu(idx_mapping_np, out=idx_mapping)
 
         # Get the number of draft tokens for each request.
         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
@@ -719,14 +728,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # No draft token scheduled (common case).
             total_num_draft_tokens = 0
             total_num_logits = num_reqs
-            cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
-            cu_num_logits = torch.arange(
-                num_reqs + 1, device=self.device, dtype=torch.int32
-            )
+            cu_num_logits_np = self.input_buffers.arange_num_reqs_np[: num_reqs + 1]
+            cu_num_logits = self.input_buffers.arange_num_reqs[: num_reqs + 1]
             expanded_idx_mapping = idx_mapping
-            expanded_local_pos = torch.zeros(
-                num_reqs, dtype=torch.int32, device=self.device
-            )
+            expanded_local_pos = self.input_buffers.zeros_num_reqs[:num_reqs]
         else:
             num_draft_tokens = np.fromiter(
                 (len(draft_tokens.get(req_id, ())) for req_id in req_ids),
@@ -737,28 +742,36 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             total_num_logits = num_reqs + total_num_draft_tokens
 
             num_logits = num_draft_tokens + 1
-            cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
+            cu_num_logits_np = self.input_buffers.cu_num_logits_np[: num_reqs + 1]
             cu_num_logits_np[0] = 0
             np.cumsum(num_logits, out=cu_num_logits_np[1:])
-            cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
+            cu_num_logits = self.input_buffers.cu_num_logits[: num_reqs + 1]
+            async_copy_to_gpu(cu_num_logits_np, out=cu_num_logits)
 
             max_expand_len = self.num_speculative_steps + 1
             expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
-                idx_mapping, total_num_logits, cu_num_logits, max_expand_len
+                idx_mapping,
+                total_num_logits,
+                cu_num_logits,
+                max_expand_len,
+                self.input_buffers.expanded_idx_mapping,
+                self.input_buffers.expanded_local_pos,
             )
 
         # Get query_start_loc.
         # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
         num_reqs_padded = batch_desc.num_reqs or num_reqs
-        query_start_loc_np = np.empty(self.max_num_reqs + 1, dtype=np.int32)
+        query_start_loc_np = self.input_buffers.query_start_loc_np[
+            : num_reqs_padded + 1
+        ]
         query_start_loc_np[0] = 0
         np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1 : num_reqs + 1])
         # Pad for full CUDA graph mode.
         # Some attention backends like FA3 require query_start_loc to be non-decreasing.
-        query_start_loc_np[num_reqs + 1 :] = num_tokens
-        async_copy_to_gpu(query_start_loc_np, out=self.input_buffers.query_start_loc)
-        query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
+        if num_reqs_padded > num_reqs:
+            query_start_loc_np[num_reqs + 1 :] = num_tokens
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]
+        async_copy_to_gpu(query_start_loc_np, out=query_start_loc)
 
         # Get prefill tokens if any.
         if self.req_states.any_prefills(idx_mapping_np):
@@ -807,6 +820,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.draft_tokens,
             cu_num_logits,
             total_num_logits,
+            self.input_buffers.logits_indices,
         )
 
         # CPU upper bound on seq_lens; padded entries left at zero.
@@ -910,6 +924,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.cu_num_logits,
             input_batch.idx_mapping,
             self.req_states.prefill_len.gpu,
+            self.input_buffers.num_rejected,
         )
         return sampler_output, num_sampled, num_rejected
 
