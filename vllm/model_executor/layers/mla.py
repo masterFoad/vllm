@@ -8,6 +8,7 @@ from vllm.config import CacheConfig
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.hadamard import get_hadamard_matrix
 
 
 @dataclass
@@ -150,7 +151,19 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c_normed = self.kv_a_layernorm(kv_c)
 
+        # Apply Orthogonal Stabilization (Hadamard Transform) to the latent vector
+        # This spreads outlier energy across all dimensions, improving quantization
+        H = get_hadamard_matrix(self.kv_lora_rank, kv_c_normed.device, kv_c_normed.dtype)
+        kv_c_normed = torch.matmul(kv_c_normed, H.t())
+
         q = q.view(-1, self.num_heads, self.qk_head_dim)
+        
+        # Apply the inverse transform (H) to the queries to preserve the dot product
+        # q_nope is the part of the query that interacts with kv_c_normed
+        q_nope = q[..., :self.qk_nope_head_dim]
+        q_nope = torch.matmul(q_nope, H)
+        q[..., :self.qk_nope_head_dim] = q_nope
+
         # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)
 
