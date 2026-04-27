@@ -546,6 +546,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
 
         # Phase 1: Find the rightmost valid window of length W
         W = sliding_window_contiguous_blocks
+        assert W > 0, "Sliding window contiguous blocks must be > 0"
         end_index = max_num_blocks - 1
 
         while end_index >= W - 1:
