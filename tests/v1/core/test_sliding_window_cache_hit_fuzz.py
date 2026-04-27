@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import sys
 from unittest.mock import MagicMock
 
@@ -7,13 +9,15 @@ sys.modules["vllm._C_stable_libtorch"] = MagicMock()
 sys.modules["vllm._C.ops"] = MagicMock()
 sys.modules["vllm._C.custom_ar"] = MagicMock()
 
-import torch
 import random
+
+import torch
+
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id
 from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
 from vllm.v1.kv_cache_interface import SlidingWindowSpec
-from vllm.utils.math_utils import cdiv
 
 
 def naive_reference_implementation(
