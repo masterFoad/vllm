@@ -527,14 +527,17 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
 
         while end_index >= W - 1:
             # Ensure end_index is aligned
+            post_pop_blocks = end_index if use_eagle else end_index + 1
             if (
                 block_size != alignment_tokens
-                and (end_index + 1) * block_size % alignment_tokens != 0
+                and (post_pop_blocks * block_size) % alignment_tokens != 0
             ):
                 end_index -= 1
                 continue
 
             miss_index = -1
+            cached_window = []
+            
             # Check from left to right to maximize the jump on a miss
             for j in range(end_index - W + 1, end_index + 1):
                 cached_block = block_pool.get_cached_block(
@@ -543,13 +546,11 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
                 if not cached_block:
                     miss_index = j
                     break
+                cached_window.append((j, cached_block))
 
             if miss_index == -1:
                 # Match found!
-                for j in range(end_index - W + 1, end_index + 1):
-                    cached_block = block_pool.get_cached_block(
-                        block_hashes[j], kv_cache_group_ids
-                    )
+                for j, cached_block in cached_window:
                     for computed, cached in zip(computed_blocks, cached_block):
                         computed[j] = cached
                 for computed in computed_blocks:
