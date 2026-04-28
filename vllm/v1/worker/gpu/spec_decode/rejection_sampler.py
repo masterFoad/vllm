@@ -6,17 +6,17 @@ from vllm.config import SpeculativeConfig
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
-from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.v1.worker.gpu.metrics.logits import get_num_nans
-from vllm.v1.worker.gpu.sample.logprob import compute_topk_logprobs
-from vllm.v1.worker.gpu.sample.output import SamplerOutput
-from vllm.v1.worker.gpu.sample.sampler import Sampler
-from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
+from vllm.v1.worker.device_tensor.input_batch import InputBatch
+from vllm.v1.worker.device_tensor.metrics.logits import get_num_nans
+from vllm.v1.worker.device_tensor.sample.logprob import compute_topk_logprobs
+from vllm.v1.worker.device_tensor.sample.output import SamplerOutput
+from vllm.v1.worker.device_tensor.sample.sampler import Sampler
+from vllm.v1.worker.device_tensor.sample.states import NO_LOGPROBS
+from vllm.v1.worker.device_tensor.spec_decode.synthetic_rejection_sampler_utils import (
+    synthetic_rejection_sample,
+)
 from vllm.v1.worker.gpu.spec_decode.probabilistic_rejection_sampler_utils import (
     probabilistic_rejection_sample,
-)
-from vllm.v1.worker.gpu.spec_decode.synthetic_rejection_sampler_utils import (
-    synthetic_rejection_sample,
 )
 
 
@@ -125,8 +125,8 @@ class RejectionSampler:
                 input_batch.idx_mapping,
                 input_batch.expanded_idx_mapping,
                 input_batch.expanded_local_pos,
-                self.sampler.sampling_states.temperature.gpu,
-                self.sampler.sampling_states.seeds.gpu,
+                self.sampler.sampling_states.temperature.device_tensor,
+                self.sampler.sampling_states.seeds.device_tensor,
                 self.num_speculative_steps,
             )
             logprobs_tensors = self._get_logprobs_tensors(
@@ -146,7 +146,7 @@ class RejectionSampler:
                 input_batch.cu_num_logits,
                 input_batch.positions[input_batch.logits_indices],
                 input_batch.idx_mapping,
-                self.sampler.sampling_states.seeds.gpu,
+                self.sampler.sampling_states.seeds.device_tensor,
                 self.synthetic_conditional_rates,
                 self.num_speculative_steps,
             )

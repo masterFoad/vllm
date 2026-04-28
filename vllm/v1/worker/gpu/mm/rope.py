@@ -8,7 +8,7 @@ import torch.nn as nn
 from vllm.config import ModelConfig
 from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsXDRoPE
 from vllm.triton_utils import tl, triton
-from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
+from vllm.v1.worker.device_tensor.buffer_utils import StagedWriteTensor, UvaBackedTensor
 
 
 class RopeState:
@@ -101,10 +101,10 @@ class RopeState:
         _prepare_rope_positions_kernel[(num_reqs,)](
             self.positions,
             self.positions.stride(0),
-            self.prefill_positions.gpu,
+            self.prefill_positions.device_tensor,
             self.num_dims * self.max_model_len,
             self.max_model_len,
-            self.prefill_delta.gpu,
+            self.prefill_delta.device_tensor,
             idx_mapping,
             query_start_loc,
             prefill_lens,

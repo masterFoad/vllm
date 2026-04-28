@@ -7,16 +7,16 @@ import torch
 import vllm.envs as envs
 from vllm.config.model import LogprobsMode
 from vllm.sampling_params import SamplingParams
-from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.v1.worker.gpu.metrics.logits import get_num_nans
-from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
-from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
-from vllm.v1.worker.gpu.sample.logprob import compute_topk_logprobs
-from vllm.v1.worker.gpu.sample.output import SamplerOutput
-from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
-from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
-from vllm.v1.worker.gpu.states import RequestState
+from vllm.v1.worker.device_tensor.input_batch import InputBatch
+from vllm.v1.worker.device_tensor.metrics.logits import get_num_nans
+from vllm.v1.worker.device_tensor.sample.bad_words import BadWordsState
+from vllm.v1.worker.device_tensor.sample.gumbel import gumbel_sample
+from vllm.v1.worker.device_tensor.sample.logit_bias import LogitBiasState
+from vllm.v1.worker.device_tensor.sample.logprob import compute_topk_logprobs
+from vllm.v1.worker.device_tensor.sample.output import SamplerOutput
+from vllm.v1.worker.device_tensor.sample.penalties import PenaltiesState
+from vllm.v1.worker.device_tensor.sample.states import NO_LOGPROBS, SamplingStates
+from vllm.v1.worker.device_tensor.states import RequestState
 
 
 class Sampler:
@@ -173,8 +173,8 @@ class Sampler:
         sampled = gumbel_sample(
             processed_logits,
             expanded_idx_mapping,
-            self.sampling_states.temperature.gpu,
-            self.sampling_states.seeds.gpu,
+            self.sampling_states.temperature.device_tensor,
+            self.sampling_states.seeds.device_tensor,
             pos,
             apply_temperature=False,
         )

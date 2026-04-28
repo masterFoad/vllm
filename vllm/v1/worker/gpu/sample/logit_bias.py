@@ -5,7 +5,7 @@ import torch
 
 from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
-from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
+from vllm.v1.worker.device_tensor.buffer_utils import StagedWriteTensor, UvaBackedTensor
 
 MAX_NUM_ALLOWED_TOKEN_IDS = 1024
 MAX_NUM_LOGIT_BIAS_TOKENS = 1024
@@ -133,14 +133,14 @@ class LogitBiasState:
             logits,
             expanded_idx_mapping,
             pos,
-            self.num_allowed_token_ids.gpu,
-            self.allowed_token_ids.gpu,
-            self.num_logit_bias.gpu,
-            self.logit_bias_token_ids.gpu,
-            self.logit_bias.gpu,
-            self.min_lens.gpu,
-            self.num_stop_token_ids.gpu,
-            self.stop_token_ids.gpu,
+            self.num_allowed_token_ids.device_tensor,
+            self.allowed_token_ids.device_tensor,
+            self.num_logit_bias.device_tensor,
+            self.logit_bias_token_ids.device_tensor,
+            self.logit_bias.device_tensor,
+            self.min_lens.device_tensor,
+            self.num_stop_token_ids.device_tensor,
+            self.stop_token_ids.device_tensor,
         )
 
 

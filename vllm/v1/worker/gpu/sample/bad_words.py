@@ -5,8 +5,8 @@ import torch
 
 from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
-from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
-from vllm.v1.worker.gpu.states import RequestState
+from vllm.v1.worker.device_tensor.buffer_utils import StagedWriteTensor, UvaBackedTensor
+from vllm.v1.worker.device_tensor.states import RequestState
 
 MAX_BAD_WORDS_TOTAL_TOKENS = 1024  # Max total tokens for all bad words per request
 MAX_NUM_BAD_WORDS = 128  # Max number of bad words per request
@@ -85,12 +85,12 @@ class BadWordsState:
         apply_bad_words(
             logits,
             expanded_idx_mapping,
-            self.bad_word_token_ids.gpu,
-            self.bad_word_offsets.gpu,
-            self.num_bad_words.gpu,
-            self.req_states.all_token_ids.gpu,
-            self.req_states.prompt_len.gpu,
-            self.req_states.total_len.gpu,
+            self.bad_word_token_ids.device_tensor,
+            self.bad_word_offsets.device_tensor,
+            self.num_bad_words.device_tensor,
+            self.req_states.all_token_ids.device_tensor,
+            self.req_states.prompt_len.device_tensor,
+            self.req_states.total_len.device_tensor,
             input_ids,
             expanded_local_pos,
             max_num_bad_words,

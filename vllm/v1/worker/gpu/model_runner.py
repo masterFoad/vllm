@@ -49,27 +49,27 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
-from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
-from vllm.v1.worker.gpu.attn_utils import (
+from vllm.v1.worker.device_tensor.async_utils import AsyncOutput, AsyncPoolingOutput
+from vllm.v1.worker.device_tensor.attn_utils import (
     build_slot_mappings_by_layer,
     get_kv_cache_spec,
     init_attn_backend,
     init_kv_cache,
 )
-from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.buffer_utils import (
+from vllm.v1.worker.device_tensor.block_table import BlockTables
+from vllm.v1.worker.device_tensor.buffer_utils import (
     DeviceMemoryManager,
     async_copy_to_gpu,
 )
-from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
-from vllm.v1.worker.gpu.cudagraph_utils import (
+from vllm.v1.worker.device_tensor.cp_utils import prepare_dcp_local_seq_lens
+from vllm.v1.worker.device_tensor.cudagraph_utils import (
     BatchExecutionDescriptor,
     ModelCudaGraphManager,
     get_uniform_token_count,
 )
-from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
-from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
-from vllm.v1.worker.gpu.input_batch import (
+from vllm.v1.worker.device_tensor.dp_utils import dispatch_cg_and_sync_dp
+from vllm.v1.worker.device_tensor.eplb_utils import EPLBController, step_eplb_after
+from vllm.v1.worker.device_tensor.input_batch import (
     InputBatch,
     InputBuffers,
     combine_sampled_and_draft_tokens,
@@ -80,27 +80,27 @@ from vllm.v1.worker.gpu.input_batch import (
     prepare_pos_seq_lens,
     prepare_prefill_inputs,
 )
-from vllm.v1.worker.gpu.kv_connector import (
+from vllm.v1.worker.device_tensor.kv_connector import (
     NO_OP_KV_CONNECTOR,
     KVConnector,
     get_kv_connector,
 )
-from vllm.v1.worker.gpu.lora_utils import LoraState
-from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
-from vllm.v1.worker.gpu.model_states import init_model_state
-from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
-from vllm.v1.worker.gpu.pp_utils import pp_broadcast, pp_receive
-from vllm.v1.worker.gpu.sample.output import SamplerOutput
-from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
-from vllm.v1.worker.gpu.sample.sampler import Sampler
-from vllm.v1.worker.gpu.spec_decode import init_speculator
-from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+from vllm.v1.worker.device_tensor.lora_utils import LoraState
+from vllm.v1.worker.device_tensor.mm.encoder_cache import EncoderCache
+from vllm.v1.worker.device_tensor.model_states import init_model_state
+from vllm.v1.worker.device_tensor.pool.pooling_runner import PoolingRunner
+from vllm.v1.worker.device_tensor.pp_utils import pp_broadcast, pp_receive
+from vllm.v1.worker.device_tensor.sample.output import SamplerOutput
+from vllm.v1.worker.device_tensor.sample.prompt_logprob import PromptLogprobsWorker
+from vllm.v1.worker.device_tensor.sample.sampler import Sampler
+from vllm.v1.worker.device_tensor.spec_decode import init_speculator
+from vllm.v1.worker.device_tensor.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
 )
-from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
-from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
-from vllm.v1.worker.gpu.states import RequestState
-from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
+from vllm.v1.worker.device_tensor.spec_decode.rejection_sampler import RejectionSampler
+from vllm.v1.worker.device_tensor.spec_decode.utils import DraftTokensHandler
+from vllm.v1.worker.device_tensor.states import RequestState
+from vllm.v1.worker.device_tensor.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 
 logger = init_logger(__name__)
@@ -515,8 +515,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 ),
                 last_sampled=self.req_states.last_sampled_tokens,
                 next_prefill_tokens=self.req_states.next_prefill_tokens,
-                temperature=self.sampler.sampling_states.temperature.gpu,
-                seeds=self.sampler.sampling_states.seeds.gpu,
+                temperature=self.sampler.sampling_states.temperature.device_tensor,
+                seeds=self.sampler.sampling_states.seeds.device_tensor,
                 dummy_run=True,
                 skip_attn_for_dummy_run=skip_attn,
                 mm_inputs=mm_inputs,
@@ -780,16 +780,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.req_states.next_prefill_tokens,
                 idx_mapping,
                 query_start_loc,
-                self.req_states.all_token_ids.gpu,
-                self.req_states.prefill_len.gpu,
-                self.req_states.num_computed_tokens.gpu,
+                self.req_states.all_token_ids.device_tensor,
+                self.req_states.prefill_len.device_tensor,
+                self.req_states.num_computed_tokens.device_tensor,
             )
 
         # Prepare positions and seq_lens.
         prepare_pos_seq_lens(
             idx_mapping,
             query_start_loc,
-            self.req_states.num_computed_tokens.gpu,
+            self.req_states.num_computed_tokens.device_tensor,
             self.input_buffers.positions,
             self.input_buffers.seq_lens,
         )
@@ -816,7 +816,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.last_sampled_tokens,
             query_start_loc,
             seq_lens,
-            self.req_states.prefill_len.gpu,
+            self.req_states.prefill_len.device_tensor,
             self.req_states.draft_tokens,
             cu_num_logits,
             total_num_logits,
@@ -923,7 +923,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.seq_lens,
             input_batch.cu_num_logits,
             input_batch.idx_mapping,
-            self.req_states.prefill_len.gpu,
+            self.req_states.prefill_len.device_tensor,
             self.input_buffers.num_rejected,
         )
         return sampler_output, num_sampled, num_rejected
@@ -943,15 +943,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output_bin_counts = None
         post_update(
             input_batch.idx_mapping,
-            self.req_states.num_computed_tokens.gpu,
+            self.req_states.num_computed_tokens.device_tensor,
             self.req_states.last_sampled_tokens,
             output_bin_counts,
             sampled_tokens,
             num_sampled,
             num_rejected,
             input_batch.query_start_loc,
-            self.req_states.all_token_ids.gpu,
-            self.req_states.total_len.gpu,
+            self.req_states.all_token_ids.device_tensor,
+            self.req_states.total_len.device_tensor,
         )
 
         # Update the number of computed prefill tokens.
@@ -1202,8 +1202,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.model.compute_logits,
             hidden_states,
             input_batch,
-            self.req_states.all_token_ids.gpu,
-            self.req_states.num_computed_tokens.gpu,
+            self.req_states.all_token_ids.device_tensor,
+            self.req_states.num_computed_tokens.device_tensor,
             self.req_states.prompt_len.np,
             self.req_states.prefill_len.np,
             self.req_states.num_computed_prefill_tokens,
@@ -1274,8 +1274,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_rejected,
                 self.req_states.last_sampled_tokens,
                 self.req_states.next_prefill_tokens,
-                self.sampler.sampling_states.temperature.gpu,
-                self.sampler.sampling_states.seeds.gpu,
+                self.sampler.sampling_states.temperature.device_tensor,
+                self.sampler.sampling_states.seeds.device_tensor,
                 mm_inputs=mm_inputs,
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
@@ -1332,7 +1332,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Update the number of computed tokens.
         post_update_pool(
             input_batch.idx_mapping,
-            self.req_states.num_computed_tokens.gpu,
+            self.req_states.num_computed_tokens.device_tensor,
             input_batch.query_start_loc,
         )
 

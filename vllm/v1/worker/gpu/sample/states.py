@@ -5,9 +5,9 @@ import torch
 
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
-from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
-from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
-from vllm.v1.worker.gpu.sample.min_p import apply_min_p
+from vllm.v1.worker.device_tensor.buffer_utils import UvaBackedTensor
+from vllm.v1.worker.device_tensor.sample.gumbel import apply_temperature
+from vllm.v1.worker.device_tensor.sample.min_p import apply_min_p
 
 NO_LOGPROBS = -1
 _NP_INT64_MIN = np.iinfo(np.int64).min
@@ -72,7 +72,7 @@ class SamplingStates:
             # No request requires temperature. Skip the kernel launch.
             return
 
-        apply_temperature(logits, expanded_idx_mapping, self.temperature.gpu)
+        apply_temperature(logits, expanded_idx_mapping, self.temperature.device_tensor)
 
     def apply_min_p(
         self,
@@ -83,7 +83,7 @@ class SamplingStates:
         if np.all(self.min_p.np[idx_mapping_np] == 0.0):
             # No request uses min_p. Skip the kernel launch.
             return
-        apply_min_p(logits, expanded_idx_mapping, self.min_p.gpu)
+        apply_min_p(logits, expanded_idx_mapping, self.min_p.device_tensor)
 
     def apply_top_k_top_p(
         self,
@@ -96,8 +96,8 @@ class SamplingStates:
         if not (do_top_k or do_top_p):
             return logits
 
-        top_k = self.top_k.gpu[expanded_idx_mapping] if do_top_k else None
-        top_p = self.top_p.gpu[expanded_idx_mapping] if do_top_p else None
+        top_k = self.top_k.device_tensor[expanded_idx_mapping] if do_top_k else None
+        top_p = self.top_p.device_tensor[expanded_idx_mapping] if do_top_p else None
         return apply_top_k_top_p(logits, top_k, top_p)
 
     def max_num_logprobs(self, idx_mapping_np: np.ndarray) -> int:

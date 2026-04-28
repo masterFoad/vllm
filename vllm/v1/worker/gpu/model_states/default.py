@@ -10,13 +10,13 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.tasks import GenerationTask
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
-from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
-from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
-from vllm.v1.worker.gpu.mm.rope import get_rope_state
-from vllm.v1.worker.gpu.model_states.interface import ModelState
-from vllm.v1.worker.gpu.states import RequestState
+from vllm.v1.worker.device_tensor.attn_utils import build_attn_metadata
+from vllm.v1.worker.device_tensor.input_batch import InputBatch
+from vllm.v1.worker.device_tensor.mm.encoder_cache import EncoderCache
+from vllm.v1.worker.device_tensor.mm.encoder_runner import EncoderRunner
+from vllm.v1.worker.device_tensor.mm.rope import get_rope_state
+from vllm.v1.worker.device_tensor.model_states.interface import ModelState
+from vllm.v1.worker.device_tensor.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
 
 
@@ -138,8 +138,8 @@ class DefaultModelState(ModelState):
         self.rope_state.prepare_positions(
             input_batch.idx_mapping,
             input_batch.query_start_loc,
-            req_states.prefill_len.gpu,
-            req_states.num_computed_tokens.gpu,
+            req_states.prefill_len.device_tensor,
+            req_states.num_computed_tokens.device_tensor,
         )
         positions = self.rope_state.get_positions(input_batch.num_tokens_after_padding)
         return {"positions": positions}

@@ -7,8 +7,8 @@ from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import async_tensor_h2d
-from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
-from vllm.v1.worker.gpu.states import RequestState
+from vllm.v1.worker.device_tensor.buffer_utils import UvaBackedTensor
+from vllm.v1.worker.device_tensor.states import RequestState
 
 
 class PenaltiesState:
@@ -66,9 +66,9 @@ class PenaltiesState:
             max_prefill_len = int(prefill_lens.max())
             bincount(
                 idx_mapping,
-                self.req_states.all_token_ids.gpu,
-                self.req_states.prompt_len.gpu,
-                self.req_states.prefill_len.gpu,
+                self.req_states.all_token_ids.device_tensor,
+                self.req_states.prompt_len.device_tensor,
+                self.req_states.prefill_len.device_tensor,
                 self.prompt_bin_mask,
                 self.output_bin_counts,
                 max_prefill_len,
@@ -97,9 +97,9 @@ class PenaltiesState:
             expanded_idx_mapping,
             input_ids,
             expanded_local_pos,
-            self.repetition_penalty.gpu,
-            self.frequency_penalty.gpu,
-            self.presence_penalty.gpu,
+            self.repetition_penalty.device_tensor,
+            self.frequency_penalty.device_tensor,
+            self.presence_penalty.device_tensor,
             self.prompt_bin_mask,
             self.output_bin_counts,
             num_speculative_tokens,

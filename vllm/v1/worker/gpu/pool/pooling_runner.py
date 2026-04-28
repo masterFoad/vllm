@@ -8,8 +8,8 @@ import torch.nn.functional as F
 
 from vllm.model_executor.models import VllmModelForPooling, is_pooling_model
 from vllm.tasks import PoolingTask
-from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.v1.worker.gpu.states import RequestState
+from vllm.v1.worker.device_tensor.input_batch import InputBatch
+from vllm.v1.worker.device_tensor.states import RequestState
 
 
 # NOTE(woosuk): Currently, this class only supports the "LAST" pooling task
@@ -37,7 +37,7 @@ class PoolingRunner:
         # TODO(woosuk): Make normalization optional.
         last_hidden_states = F.normalize(last_hidden_states, p=2, dim=-1)
 
-        prompt_len = req_states.prompt_len.gpu[input_batch.idx_mapping]
+        prompt_len = req_states.prompt_len.device_tensor[input_batch.idx_mapping]
         is_valid = input_batch.seq_lens == prompt_len
         return last_hidden_states, is_valid
 

@@ -7,7 +7,7 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
-from vllm.v1.worker.gpu.buffer_utils import (
+from vllm.v1.worker.device_tensor.buffer_utils import (
     DeviceMemoryManager,
     StagedWriteTensor,
     UvaBackedTensor,
@@ -53,10 +53,10 @@ class BlockTables:
             )
             self.block_tables.append(block_table)
         self.block_table_ptrs = self._make_ptr_tensor(
-            [b.gpu for b in self.block_tables]
+            [b.device_tensor for b in self.block_tables]
         )
         self.block_table_strides = torch.tensor(
-            [b.gpu.stride(0) for b in self.block_tables],
+            [b.device_tensor.stride(0) for b in self.block_tables],
             dtype=torch.int64,
             device=self.device,
         )
@@ -72,7 +72,7 @@ class BlockTables:
         # Block tables used for model's forward pass.
         # num_kv_cache_groups x [max_num_reqs, max_num_blocks]
         self.input_block_tables: list[torch.Tensor] = [
-            torch.zeros_like(b.gpu) for b in self.block_tables
+            torch.zeros_like(b.device_tensor) for b in self.block_tables
         ]
         self.input_block_table_ptrs = self._make_ptr_tensor(self.input_block_tables)
 
@@ -120,8 +120,8 @@ class BlockTables:
             self.block_table_ptrs,
             self.input_block_table_ptrs,
             self.block_table_strides,
-            self.num_blocks.gpu,
-            self.num_blocks.gpu.stride(0),
+            self.num_blocks.device_tensor,
+            self.num_blocks.device_tensor.stride(0),
             num_reqs,
             self.input_block_tables[0].shape[1],  # max_num_blocks
             BLOCK_SIZE=1024,  # type: ignore
