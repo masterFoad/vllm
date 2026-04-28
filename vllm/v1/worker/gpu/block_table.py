@@ -7,11 +7,7 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
-from vllm.v1.worker.device_tensor.buffer_utils import (
-    DeviceMemoryManager,
-    StagedWriteTensor,
-    UvaBackedTensor,
-)
+from vllm.v1.worker.device_tensor.buffer_utils import StagedWriteTensor, UvaBackedTensor
 
 
 class BlockTables:
@@ -25,14 +21,12 @@ class BlockTables:
         cp_size: int = 1,
         cp_rank: int = 0,
         cp_interleave: int = 1,
-        memory_manager: DeviceMemoryManager | None = None,
     ):
         self.block_sizes = block_sizes
         self.max_num_reqs = max_num_reqs
         self.max_num_batched_tokens = max_num_batched_tokens
         self.max_model_len = max_model_len
         self.device = device
-        self.memory_manager = memory_manager or DeviceMemoryManager(device)
 
         self.cp_size = cp_size
         self.cp_rank = cp_rank
@@ -47,9 +41,10 @@ class BlockTables:
             # As a result, one block on the current rank covers `block_size * cp_size`
             # tokens in the full, global (unsharded) sequence.
             max_num_blocks = cdiv(self.max_model_len, block_size * self.cp_size)
-            block_table = self.memory_manager.get_staged_writer(
+            block_table = StagedWriteTensor(
                 (self.max_num_reqs, max_num_blocks),
                 dtype=torch.int32,
+                device=device,
             )
             self.block_tables.append(block_table)
         self.block_table_ptrs = self._make_ptr_tensor(

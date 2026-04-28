@@ -98,16 +98,15 @@ class UvaBackedTensor:
     def copy_to_uva(self, n: int | None = None) -> torch.Tensor:
         # CPU-to-CPU copy
         self.device_tensor = self.pool.copy_to_uva(
-            self.np[:n] if n is not None else self.np
-        )
+            self.np[:n] if n is not None else self.np)
         return self.device_tensor
 
 
 class StagedWriteTensor(ABC):
+
     @abstractmethod
-    def stage_write(
-        self, index: int, start: int, x: Iterable[int] | Iterable[float]
-    ) -> None:
+    def stage_write(self, index: int, start: int,
+                    x: Iterable[int] | Iterable[float]) -> None:
         pass
 
     @abstractmethod
@@ -129,6 +128,7 @@ class StagedWriteTensor(ABC):
 
 
 class CUDAStagedWriteTensor(StagedWriteTensor):
+
     def __init__(
         self,
         size: int | Sequence[int],
@@ -171,14 +171,12 @@ class CUDAStagedWriteTensor(StagedWriteTensor):
     def device_tensor(self) -> torch.Tensor:
         return self._device_tensor
 
-    def stage_write(
-        self, index: int, start: int, x: Iterable[int] | Iterable[float]
-    ) -> None:
+    def stage_write(self, index: int, start: int,
+                    x: Iterable[int] | Iterable[float]) -> None:
         assert index >= 0
         assert start >= 0
-        if x is None or (
-            isinstance(x, (list, tuple, np.ndarray, torch.Tensor)) and len(x) == 0
-        ):
+        if x is None or (isinstance(x, (list, tuple, np.ndarray, torch.Tensor))
+                         and len(x) == 0):
             return
         self._staged_write_indices.append(index)
         self._staged_write_starts.append(start)
@@ -202,12 +200,13 @@ class CUDAStagedWriteTensor(StagedWriteTensor):
         cu_lens_uva = self.write_cu_lens.copy_to_uva(self._staged_write_cu_lens)
 
         # Special handling for write_contents
-        write_contents = async_tensor_h2d(
-            self._staged_write_contents, self.dtype, self.device, pin_memory=True
-        )
+        write_contents = async_tensor_h2d(self._staged_write_contents,
+                                          self.dtype,
+                                          self.device,
+                                          pin_memory=True)
 
         # Write diffs to the GPU buffer
-        _apply_write_kernel[(n,)](
+        _apply_write_kernel[(n, )](
             self._device_tensor,
             self._device_tensor.stride(0),
             indices_uva,
@@ -227,6 +226,7 @@ class CUDAStagedWriteTensor(StagedWriteTensor):
 
 
 class CPUStagedWriteTensor(StagedWriteTensor):
+
     def __init__(
         self,
         size: int | Sequence[int],
@@ -243,12 +243,10 @@ class CPUStagedWriteTensor(StagedWriteTensor):
     def device_tensor(self) -> torch.Tensor:
         return self._device_tensor
 
-    def stage_write(
-        self, index: int, start: int, x: Iterable[int] | Iterable[float]
-    ) -> None:
-        if x is None or (
-            isinstance(x, (list, tuple, np.ndarray, torch.Tensor)) and len(x) == 0
-        ):
+    def stage_write(self, index: int, start: int,
+                    x: Iterable[int] | Iterable[float]) -> None:
+        if x is None or (isinstance(x, (list, tuple, np.ndarray, torch.Tensor))
+                         and len(x) == 0):
             return
         # Use list.append() for fast staging
         self._staged_writes.append((index, start, list(x)))
@@ -267,9 +265,8 @@ class CPUStagedWriteTensor(StagedWriteTensor):
                 self._device_tensor[index] = x[0]
             else:
                 # For 2D tensors (e.g. all_token_ids, block_tables)
-                self._device_tensor[index, start : start + n] = torch.tensor(
-                    x, dtype=self.dtype, device=self.device
-                )
+                self._device_tensor[index, start:start + n] = torch.tensor(
+                    x, dtype=self.dtype, device=self.device)
         self.clear_staged_writes()
 
     def clear_staged_writes(self) -> None:
@@ -277,6 +274,7 @@ class CPUStagedWriteTensor(StagedWriteTensor):
 
 
 class DeviceMemoryManager:
+
     def __init__(self, device: torch.device):
         self.device = device
         self.is_cpu = device.type == "cpu"
@@ -291,9 +289,8 @@ class DeviceMemoryManager:
         if self.is_cpu:
             return CPUStagedWriteTensor(size, dtype, self.device)
         else:
-            return CUDAStagedWriteTensor(
-                size, dtype, self.device, max_concurrency, uva_instead_of_gpu
-            )
+            return CUDAStagedWriteTensor(size, dtype, self.device,
+                                         max_concurrency, uva_instead_of_gpu)
 
 
 @triton.jit
@@ -318,6 +315,6 @@ def _apply_write_kernel(
         block = i + tl.arange(0, BLOCK_SIZE)
         mask = block < content_len
         content = tl.load(write_contents_ptr + cu_start + block, mask=mask)
-        tl.store(
-            output_ptr + row_idx * output_stride + start_idx + block, content, mask=mask
-        )
+        tl.store(output_ptr + row_idx * output_stride + start_idx + block,
+                 content,
+                 mask=mask)

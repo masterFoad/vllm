@@ -12,11 +12,11 @@ from vllm.v1.worker.device_tensor.sample.logprob import compute_topk_logprobs
 from vllm.v1.worker.device_tensor.sample.output import SamplerOutput
 from vllm.v1.worker.device_tensor.sample.sampler import Sampler
 from vllm.v1.worker.device_tensor.sample.states import NO_LOGPROBS
+from vllm.v1.worker.device_tensor.spec_decode.probabilistic_rejection_sampler_utils import (
+    probabilistic_rejection_sample,
+)
 from vllm.v1.worker.device_tensor.spec_decode.synthetic_rejection_sampler_utils import (
     synthetic_rejection_sample,
-)
-from vllm.v1.worker.gpu.spec_decode.probabilistic_rejection_sampler_utils import (
-    probabilistic_rejection_sample,
 )
 
 

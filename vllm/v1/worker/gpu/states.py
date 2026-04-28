@@ -3,7 +3,7 @@
 import numpy as np
 import torch
 
-from vllm.v1.worker.device_tensor.buffer_utils import (
+from vllm.v1.worker.gpu.buffer_utils import (
     DeviceMemoryManager,
     UvaBackedTensor,
 )
