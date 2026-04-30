@@ -283,14 +283,12 @@ def prepare_pos_seq_lens(
     idx_mapping: torch.Tensor,
     query_start_loc: torch.Tensor,
     num_computed_tokens: torch.Tensor,
-    pos: torch.Tensor,
+    positions: torch.Tensor,
     seq_lens: torch.Tensor,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
-    # NOTE(woosuk): We do +1 because the last thread block is used
-    # to pad unused seq_lens as 0 for full CUDA graphs.
     _prepare_pos_seq_lens_kernel[(num_reqs + 1,)](
-        pos,
+        positions,
         seq_lens,
         idx_mapping,
         query_start_loc,
@@ -369,6 +367,11 @@ def combine_sampled_and_draft_tokens(
     num_logits: int,
     logits_indices: torch.Tensor,
 ) -> torch.Tensor:
+    assert num_logits <= logits_indices.shape[0], (
+        "num_logits "
+        f"({num_logits}) exceeds logits_indices capacity "
+        f"({logits_indices.shape[0]})"
+    )
     # use idx_mapping.shape[0] for actual request count
     num_reqs = idx_mapping.shape[0]
     num_speculative_steps = draft_tokens.shape[-1]
@@ -597,6 +600,16 @@ def expand_idx_mapping(
     expanded_idx_mapping: torch.Tensor,
     expanded_local_pos: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    assert total_num_logits <= expanded_idx_mapping.shape[0], (
+        "total_num_logits "
+        f"({total_num_logits}) exceeds expanded_idx_mapping capacity "
+        f"({expanded_idx_mapping.shape[0]})"
+    )
+    assert total_num_logits <= expanded_local_pos.shape[0], (
+        "total_num_logits "
+        f"({total_num_logits}) exceeds expanded_local_pos capacity "
+        f"({expanded_local_pos.shape[0]})"
+    )
     num_reqs = idx_mapping.shape[0]
     expanded_idx_mapping_slice = expanded_idx_mapping[:total_num_logits]
     expanded_local_pos_slice = expanded_local_pos[:total_num_logits]
