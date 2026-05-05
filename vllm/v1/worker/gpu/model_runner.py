@@ -711,8 +711,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         idx_mapping_iter = map(self.req_states.req_id_to_index.get, req_ids)
         idx_mapping_np = self.input_buffers.idx_mapping_np[:num_reqs]
-        for i, idx in enumerate(idx_mapping_iter):
-            idx_mapping_np[i] = idx
+        idx_mapping_np[:] = np.fromiter(
+            idx_mapping_iter, dtype=np.int32, count=num_reqs
+        )
         idx_mapping = self.input_buffers.idx_mapping[:num_reqs]
         async_copy_to_gpu(idx_mapping_np, out=idx_mapping)
 
