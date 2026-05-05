@@ -52,6 +52,7 @@ class InputBuffers:
         self.logits_indices = torch.empty(
             max_num_tokens, dtype=torch.int64, device=device
         )
+        # Must match dtype of sampler_output.num_sampled (int32).
         self.num_rejected = torch.empty(max_num_reqs, dtype=torch.int32, device=device)
 
         # Prebuilt arange buffer for common case (no draft tokens)
