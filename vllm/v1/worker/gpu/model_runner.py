@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from copy import deepcopy
 from typing import Any, NamedTuple
@@ -101,6 +102,111 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 
 logger = init_logger(__name__)
 
+_PREPARE_INPUTS_PROFILE_ENV = "VLLM_PROFILE_PREPARE_INPUTS"
+_PREPARE_INPUTS_PROFILE_INTERVAL_ENV = "VLLM_PROFILE_PREPARE_INPUTS_INTERVAL"
+
+
+def _env_flag_enabled(name: str) -> bool:
+    value = os.environ.get(name, "")
+    return value.strip().lower() not in ("", "0", "false", "no", "off")
+
+
+class _PrepareInputsProfiler:
+    _ORDER = (
+        "request_sort",
+        "num_scheduled_tokens_build",
+        "idx_mapping_build",
+        "idx_mapping_copy",
+        "cu_num_logits_prep",
+        "cu_num_logits_copy",
+        "expand_idx_mapping",
+        "query_start_loc_prep",
+        "query_start_loc_copy",
+        "any_prefills",
+        "prepare_prefill_inputs",
+        "prepare_pos_seq_lens",
+        "dcp_local_seq_lens",
+        "combine_sampled_and_draft_tokens",
+        "seq_lens_cpu_upper_bound",
+        "total_prepare_inputs",
+    )
+
+    def __init__(self, interval: int, rank: int) -> None:
+        self.interval = max(1, interval)
+        self.rank = rank
+        self.count = 0
+        self.total_reqs = 0
+        self.total_tokens = 0
+        self.totals_us = {name: 0.0 for name in self._ORDER}
+        self.max_us = {name: 0.0 for name in self._ORDER}
+
+    @classmethod
+    def from_env(cls, rank: int) -> "_PrepareInputsProfiler | None":
+        if not _env_flag_enabled(_PREPARE_INPUTS_PROFILE_ENV):
+            return None
+        try:
+            interval = int(os.environ.get(_PREPARE_INPUTS_PROFILE_INTERVAL_ENV, "1000"))
+        except ValueError:
+            interval = 1000
+            logger.warning(
+                "Invalid %s value; using default interval %d",
+                _PREPARE_INPUTS_PROFILE_INTERVAL_ENV,
+                interval,
+            )
+        logger.info(
+            "Enabled prepare_inputs profiling: %s=1, %s=%d",
+            _PREPARE_INPUTS_PROFILE_ENV,
+            _PREPARE_INPUTS_PROFILE_INTERVAL_ENV,
+            interval,
+        )
+        return cls(interval=interval, rank=rank)
+
+    @staticmethod
+    def start() -> float:
+        return time.perf_counter()
+
+    def record(self, name: str, start_time: float) -> None:
+        elapsed_us = (time.perf_counter() - start_time) * 1e6
+        self.totals_us[name] += elapsed_us
+        self.max_us[name] = max(self.max_us[name], elapsed_us)
+
+    def maybe_report(self, num_reqs: int, num_tokens: int) -> None:
+        self.count += 1
+        self.total_reqs += num_reqs
+        self.total_tokens += num_tokens
+        if self.count % self.interval == 0:
+            self.report_and_reset()
+
+    def report_and_reset(self) -> None:
+        if self.count == 0:
+            return
+        avg_us = {
+            name: self.totals_us[name] / self.count
+            for name in self._ORDER
+            if self.totals_us[name] > 0.0
+        }
+        max_us = {
+            name: self.max_us[name]
+            for name in self._ORDER
+            if self.max_us[name] > 0.0
+        }
+        logger.info(
+            "prepare_inputs profile rank=%d batches=%d avg_reqs=%.2f "
+            "avg_tokens=%.2f avg_us=%s max_us=%s",
+            self.rank,
+            self.count,
+            self.total_reqs / self.count,
+            self.total_tokens / self.count,
+            avg_us,
+            max_us,
+        )
+        self.count = 0
+        self.total_reqs = 0
+        self.total_tokens = 0
+        for name in self._ORDER:
+            self.totals_us[name] = 0.0
+            self.max_us[name] = 0.0
+
 
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
@@ -144,6 +250,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Data parallelism.
         self.dp_size = self.parallel_config.data_parallel_size
         self.dp_rank = self.parallel_config.data_parallel_rank
+        self.prepare_inputs_profiler = _PrepareInputsProfiler.from_env(self.dp_rank)
 
         # Decode context parallelism.
         self.dcp_size = self.parallel_config.decode_context_parallel_size
@@ -696,6 +803,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def prepare_inputs(
         self, scheduler_output: SchedulerOutput, batch_desc: BatchExecutionDescriptor
     ) -> InputBatch:
+        profiler = self.prepare_inputs_profiler
+        total_start = 0.0
+        if profiler is not None:
+            total_start = profiler.start()
+
         num_tokens = scheduler_output.total_num_scheduled_tokens
         num_tokens_after_padding = batch_desc.num_tokens
         assert num_tokens > 0
@@ -704,30 +816,54 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Decode first, then prefill.
         # batch_idx -> req_id
+        if profiler is not None:
+            step_start = profiler.start()
         req_ids = sorted(num_tokens_per_req, key=num_tokens_per_req.get)  # type: ignore[arg-type]
+        if profiler is not None:
+            profiler.record("request_sort", step_start)
+
+        if profiler is not None:
+            step_start = profiler.start()
         numtoks_iter = map(num_tokens_per_req.get, req_ids)
         num_scheduled_tokens = np.fromiter(numtoks_iter, dtype=np.int32, count=num_reqs)
+        if profiler is not None:
+            profiler.record("num_scheduled_tokens_build", step_start)
 
+        if profiler is not None:
+            step_start = profiler.start()
         idx_mapping_iter = map(self.req_states.req_id_to_index.get, req_ids)
         idx_mapping_np = self.input_buffers.idx_mapping_np[:num_reqs]
         idx_mapping_np[:] = np.fromiter(
             idx_mapping_iter, dtype=np.int32, count=num_reqs
         )
+        if profiler is not None:
+            profiler.record("idx_mapping_build", step_start)
+
         idx_mapping_cpu = self.input_buffers.idx_mapping_cpu[:num_reqs]
         idx_mapping = self.input_buffers.idx_mapping[:num_reqs]
+        if profiler is not None:
+            step_start = profiler.start()
         idx_mapping.copy_(idx_mapping_cpu, non_blocking=True)
+        if profiler is not None:
+            profiler.record("idx_mapping_copy", step_start)
 
         # Get the number of draft tokens for each request.
         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
         if not draft_tokens:
             # No draft token scheduled (common case).
+            if profiler is not None:
+                step_start = profiler.start()
             total_num_draft_tokens = 0
             total_num_logits = num_reqs
             cu_num_logits_np = self.input_buffers.arange_num_reqs_np[: num_reqs + 1]
             cu_num_logits = self.input_buffers.arange_num_reqs[: num_reqs + 1]
             expanded_idx_mapping = idx_mapping
             expanded_local_pos = self.input_buffers.zeros_num_reqs[:num_reqs]
+            if profiler is not None:
+                profiler.record("cu_num_logits_prep", step_start)
         else:
+            if profiler is not None:
+                step_start = profiler.start()
             num_draft_tokens = np.fromiter(
                 (len(draft_tokens.get(req_id, ())) for req_id in req_ids),
                 dtype=np.int32,
@@ -740,11 +876,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cu_num_logits_np = self.input_buffers.cu_num_logits_np[: num_reqs + 1]
             cu_num_logits_np[0] = 0
             np.cumsum(num_logits, out=cu_num_logits_np[1:])
+            if profiler is not None:
+                profiler.record("cu_num_logits_prep", step_start)
+
             cu_num_logits_cpu = self.input_buffers.cu_num_logits_cpu[: num_reqs + 1]
             cu_num_logits = self.input_buffers.cu_num_logits[: num_reqs + 1]
+            if profiler is not None:
+                step_start = profiler.start()
             cu_num_logits.copy_(cu_num_logits_cpu, non_blocking=True)
+            if profiler is not None:
+                profiler.record("cu_num_logits_copy", step_start)
 
             max_expand_len = self.num_speculative_steps + 1
+            if profiler is not None:
+                step_start = profiler.start()
             expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
                 idx_mapping,
                 total_num_logits,
@@ -753,9 +898,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.input_buffers.expanded_idx_mapping,
                 self.input_buffers.expanded_local_pos,
             )
+            if profiler is not None:
+                profiler.record("expand_idx_mapping", step_start)
 
         # Get query_start_loc.
         # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
+        if profiler is not None:
+            step_start = profiler.start()
         num_reqs_padded = batch_desc.num_reqs or num_reqs
         query_start_loc_np = self.input_buffers.query_start_loc_np[
             : num_reqs_padded + 1
@@ -766,14 +915,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Some attention backends like FA3 require query_start_loc to be non-decreasing.
         if num_reqs_padded > num_reqs:
             query_start_loc_np[num_reqs + 1 :] = num_tokens
+        if profiler is not None:
+            profiler.record("query_start_loc_prep", step_start)
+
         query_start_loc_cpu = self.input_buffers.query_start_loc_cpu[
             : num_reqs_padded + 1
         ]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]
+        if profiler is not None:
+            step_start = profiler.start()
         query_start_loc.copy_(query_start_loc_cpu, non_blocking=True)
+        if profiler is not None:
+            profiler.record("query_start_loc_copy", step_start)
 
         # Get prefill tokens if any.
-        if self.req_states.any_prefills(idx_mapping_np):
+        if profiler is not None:
+            step_start = profiler.start()
+        has_prefills = self.req_states.any_prefills(idx_mapping_np)
+        if profiler is not None:
+            profiler.record("any_prefills", step_start)
+        if has_prefills:
+            if profiler is not None:
+                step_start = profiler.start()
             prepare_prefill_inputs(
                 self.input_buffers.input_ids,
                 self.req_states.next_prefill_tokens,
@@ -783,8 +946,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.req_states.prefill_len.gpu,
                 self.req_states.num_computed_tokens.gpu,
             )
+            if profiler is not None:
+                profiler.record("prepare_prefill_inputs", step_start)
 
         # Prepare positions and seq_lens.
+        if profiler is not None:
+            step_start = profiler.start()
         prepare_pos_seq_lens(
             idx_mapping,
             query_start_loc,
@@ -793,10 +960,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.input_buffers.seq_lens,
         )
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
+        if profiler is not None:
+            profiler.record("prepare_pos_seq_lens", step_start)
 
         dcp_local_seq_lens = None
         if self.use_dcp:
             # Prepare dcp local seq_lens.
+            if profiler is not None:
+                step_start = profiler.start()
             prepare_dcp_local_seq_lens(
                 self.input_buffers.dcp_local_seq_lens,
                 self.input_buffers.seq_lens,
@@ -806,9 +977,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.cp_interleave,
             )
             dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens[:num_reqs_padded]
+            if profiler is not None:
+                profiler.record("dcp_local_seq_lens", step_start)
 
         # Some input token ids are directly read from the last sampled tokens
         # and draft tokens. Also, get the logits indices to sample tokens from.
+        if profiler is not None:
+            step_start = profiler.start()
         logits_indices = combine_sampled_and_draft_tokens(
             self.input_buffers.input_ids,
             idx_mapping,
@@ -821,8 +996,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             total_num_logits,
             self.input_buffers.logits_indices,
         )
+        if profiler is not None:
+            profiler.record("combine_sampled_and_draft_tokens", step_start)
 
         # CPU upper bound on seq_lens; padded entries left at zero.
+        if profiler is not None:
+            step_start = profiler.start()
         seq_lens_cpu_upper_bound_np = self.input_buffers.seq_lens_cpu_upper_bound_np[
             :num_reqs_padded
         ]
@@ -841,6 +1020,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         seq_lens_cpu_upper_bound = self.input_buffers.seq_lens_cpu_upper_bound_cpu[
             :num_reqs_padded
         ]
+        if profiler is not None:
+            profiler.record("seq_lens_cpu_upper_bound", step_start)
+            profiler.record("total_prepare_inputs", total_start)
+            profiler.maybe_report(num_reqs=num_reqs, num_tokens=num_tokens)
+
         return InputBatch(
             req_ids=req_ids,
             num_reqs=num_reqs,
