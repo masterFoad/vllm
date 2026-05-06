@@ -123,10 +123,10 @@ data:
         r1 = bench_shared_prefix(
             "facebook/opt-125m",
             num_prompts=24,
-            prefix_repeat=160,
+            prefix_repeat=48,
             max_tokens=32,
             gpu_mem=0.4,
-            max_model_len=4096,
+            max_model_len=2048,
         )
         print("  {:.2f} req/s | {:.1f} gen tok/s".format(r1["req_s"], r1["gen_tok_s"]))
 
@@ -134,7 +134,7 @@ data:
         r2 = bench_shared_prefix(
             "Qwen/Qwen2.5-1.5B-Instruct",
             num_prompts=16,
-            prefix_repeat=192,
+            prefix_repeat=64,
             max_tokens=32,
             gpu_mem=0.7,
             max_model_len=4096,
@@ -145,7 +145,7 @@ data:
         r2b = bench_shared_prefix(
             "Qwen/Qwen2.5-1.5B-Instruct",
             num_prompts=16,
-            prefix_repeat=192,
+            prefix_repeat=64,
             max_tokens=32,
             gpu_mem=0.7,
             max_model_len=4096,
