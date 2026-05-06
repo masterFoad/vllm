@@ -42,12 +42,20 @@ def test_cascade_attention(example_system_message, attn_backend):
     not current_platform.is_cuda(),
     reason="FlashInfer cascade debug repro is CUDA-only.",
 )
-def test_flashinfer_cascade_attention_debug_repro(example_system_message, monkeypatch):
-    monkeypatch.setenv("VLLM_ENABLE_FLASHINFER_EXPERIMENTAL_CASCADE_ATTN", "1")
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "Qwen/Qwen2-1.5B-Instruct",
+        "Qwen/Qwen2.5-1.5B-Instruct",
+    ],
+)
+def test_flashinfer_repeated_batch_mismatch_repro(
+    example_system_message, model_name
+):
     prompt = "\n<User>: Implement fibonacci sequence in Python.\n<Claude>:"
 
     llm = LLM(
-        model="Qwen/Qwen2-1.5B-Instruct",
+        model=model_name,
         attention_config={"backend": "FLASHINFER"},
         enforce_eager=True,
         disable_log_stats=True,
@@ -68,7 +76,7 @@ def test_flashinfer_cascade_attention_debug_repro(example_system_message, monkey
         if response.outputs[0].text != ref_output
     ]
     assert not mismatches, (
-        f"FlashInfer cascade diverged on {len(mismatches)}/{len(prompts)} repeated "
-        f"shared-prefix prompts. First mismatch: {mismatches[0]!r}; "
-        f"reference={ref_output!r}"
+        f"FlashInfer repeated-batch output diverged on model={model_name!r} "
+        f"for {len(mismatches)}/{len(prompts)} identical shared-prefix prompts. "
+        f"First mismatch: {mismatches[0]!r}; reference={ref_output!r}"
     )
