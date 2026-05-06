@@ -1,0 +1,336 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vllm-bench-shared-prefix-cascade-scripts
+  namespace: wdu-research
+data:
+  patch_pr.py: |
+    import os, shutil, sys
+
+    def changed_files(main_dir, pr_dir):
+        result = []
+        for root, dirs, files in os.walk(pr_dir):
+            for fname in files:
+                if not fname.endswith('.py'):
+                    continue
+                pr_file  = os.path.join(root, fname)
+                rel      = os.path.relpath(pr_file, pr_dir)
+                main_file = os.path.join(main_dir, rel)
+                try:
+                    same = open(pr_file, 'rb').read() == open(main_file, 'rb').read()
+                except FileNotFoundError:
+                    same = False
+                if not same:
+                    result.append((rel, pr_file))
+        return result
+
+    cmd = sys.argv[1]
+
+    if cmd == 'apply':
+        main_dir, pr_dir, installed_dir = sys.argv[2], sys.argv[3], sys.argv[4]
+        changes = changed_files(main_dir, pr_dir)
+        print("PR modifies {} Python file(s) vs main:".format(len(changes)))
+        for rel, _ in changes:
+            print("  {}".format(rel))
+        for rel, pr_file in changes:
+            dst = os.path.join(installed_dir, rel)
+            if os.path.exists(dst):
+                shutil.copy2(dst, dst + '.bak')
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(pr_file, dst)
+        print("Applied.")
+
+    elif cmd == 'revert':
+        installed_dir = sys.argv[2]
+        n = 0
+        for root, dirs, files in os.walk(installed_dir):
+            for fname in files:
+                if fname.endswith('.bak'):
+                    bak  = os.path.join(root, fname)
+                    orig = bak[:-4]
+                    shutil.copy2(bak, orig)
+                    os.remove(bak)
+                    n += 1
+        print("Reverted {} file(s).".format(n))
+
+  bench_e2e.py: |
+    import gc, json, os, sys, time
+    import torch
+    from vllm import LLM, SamplingParams
+
+    def make_shared_prefix_prompts(num_prompts: int, prefix_repeat: int):
+        shared_prefix = (
+            "System policy: answer concisely and preserve factual accuracy. "
+            "Context block: open-source serving systems often batch requests with "
+            "identical system prompts and long shared setup instructions. "
+        ) * prefix_repeat
+        prompts = []
+        for i in range(num_prompts):
+            prompts.append(
+                shared_prefix
+                + "\n\nUser question {}: Summarize why shared-prefix decode can reduce KV reads. Give one sentence and one bullet.".format(i)
+            )
+        return prompts
+
+    def bench_shared_prefix(model_name, num_prompts, prefix_repeat, max_tokens, gpu_mem, max_model_len):
+        sp = SamplingParams(temperature=0.0, max_tokens=max_tokens, seed=42)
+        prompts = make_shared_prefix_prompts(num_prompts, prefix_repeat)
+        llm = LLM(
+            model=model_name,
+            gpu_memory_utilization=gpu_mem,
+            max_model_len=max_model_len,
+            enforce_eager=False,
+            enable_prefix_caching=True,
+            disable_cascade_attn=False,
+            attention_backend="FLASHINFER",
+        )
+        _ = llm.generate(prompts[:4], sp)
+        _ = llm.generate(prompts[:4], sp)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        outputs = llm.generate(prompts, sp)
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - t0
+        out_toks = sum(len(o.outputs[0].token_ids) for o in outputs)
+        in_toks = sum(len(o.prompt_token_ids) for o in outputs)
+        result = {
+            "model": model_name,
+            "elapsed": round(elapsed, 4),
+            "req_s": round(num_prompts / elapsed, 4),
+            "gen_tok_s": round(out_toks / elapsed, 2),
+            "total_tok_s": round((in_toks + out_toks) / elapsed, 2),
+            "token_ids": [list(o.outputs[0].token_ids) for o in outputs],
+            "num_prompts": num_prompts,
+            "prefix_repeat": prefix_repeat,
+        }
+        del llm
+        gc.collect()
+        torch.cuda.empty_cache()
+        return result
+
+    if __name__ == '__main__':
+        branch = sys.argv[1]
+        out_dir = sys.argv[2]
+
+        import vllm
+        print("vLLM:", vllm.__version__)
+        print("vLLM path:", os.path.dirname(vllm.__file__))
+        print("CUDA device:", torch.cuda.get_device_name())
+        print("Experimental FlashInfer cascade:", os.getenv("VLLM_ENABLE_FLASHINFER_EXPERIMENTAL_CASCADE_ATTN", "0"))
+
+        print("\n--- shared-prefix / facebook/opt-125m ---")
+        r1 = bench_shared_prefix(
+            "facebook/opt-125m",
+            num_prompts=24,
+            prefix_repeat=160,
+            max_tokens=32,
+            gpu_mem=0.4,
+            max_model_len=4096,
+        )
+        print("  {:.2f} req/s | {:.1f} gen tok/s".format(r1["req_s"], r1["gen_tok_s"]))
+
+        print("\n--- shared-prefix / Qwen/Qwen2.5-1.5B-Instruct ---")
+        r2 = bench_shared_prefix(
+            "Qwen/Qwen2.5-1.5B-Instruct",
+            num_prompts=16,
+            prefix_repeat=192,
+            max_tokens=32,
+            gpu_mem=0.7,
+            max_model_len=4096,
+        )
+        print("  {:.2f} req/s | {:.1f} gen tok/s".format(r2["req_s"], r2["gen_tok_s"]))
+
+        print("\n--- Determinism check (second Qwen run) ---")
+        r2b = bench_shared_prefix(
+            "Qwen/Qwen2.5-1.5B-Instruct",
+            num_prompts=16,
+            prefix_repeat=192,
+            max_tokens=32,
+            gpu_mem=0.7,
+            max_model_len=4096,
+        )
+        matches = sum(1 for i in range(16) if r2["token_ids"][i] == r2b["token_ids"][i])
+        print("  Exact token matches: {}/16".format(matches))
+
+        payload = {
+            "branch": branch,
+            "opt125m_shared_prefix": {k: v for k, v in r1.items() if k != "token_ids"},
+            "qwen15b_shared_prefix": {k: v for k, v in r2.items() if k != "token_ids"},
+            "determinism_same_branch": "{}/16".format(matches),
+            "token_ids_qwen": r2["token_ids"],
+        }
+        out_path = "{}/results_{}.json".format(out_dir, branch)
+        with open(out_path, "w") as fh:
+            json.dump(payload, fh, indent=2)
+        print("\nSaved:", out_path)
+
+  compare.py: |
+    import json, sys
+
+    out_dir = sys.argv[1]
+    main = json.load(open("{}/results_main.json".format(out_dir)))
+    opt = json.load(open("{}/results_optimized.json".format(out_dir)))
+
+    print()
+    print("=" * 72)
+    print("  RESULTS: main vs exp-shared-prefix-cascade-flashinfer")
+    print("=" * 72)
+    print()
+    print("{:<30} {:>11} {:>11} {:>9}".format("Model", "main req/s", "opt req/s", "Delta"))
+    print("-" * 67)
+    for key, label in [("opt125m_shared_prefix", "opt-125m shared-prefix"), ("qwen15b_shared_prefix", "Qwen2.5-1.5B shared-prefix")]:
+        m_r = main[key]["req_s"]
+        o_r = opt[key]["req_s"]
+        print("{:<30} {:>11.2f} {:>11.2f} {:>+8.1f}%".format(label, m_r, o_r, (o_r - m_r) / m_r * 100))
+    print()
+    print("{:<30} {:>11} {:>11} {:>9}".format("Model", "main tok/s", "opt tok/s", "Delta"))
+    print("-" * 67)
+    for key, label in [("opt125m_shared_prefix", "opt-125m shared-prefix"), ("qwen15b_shared_prefix", "Qwen2.5-1.5B shared-prefix")]:
+        m_g = main[key]["gen_tok_s"]
+        o_g = opt[key]["gen_tok_s"]
+        print("{:<30} {:>11.1f} {:>11.1f} {:>+8.1f}%".format(label, m_g, o_g, (o_g - m_g) / m_g * 100))
+    print()
+    main_ids = main["token_ids_qwen"]
+    opt_ids = opt["token_ids_qwen"]
+    cross = sum(1 for a, b in zip(main_ids, opt_ids) if a == b)
+    print("Cross-branch token match  : {}/16".format(cross))
+    print("Determinism (main)        : {}".format(main["determinism_same_branch"]))
+    print("Determinism (optimized)   : {}".format(opt["determinism_same_branch"]))
+    print()
+    verdict = "PASS - outputs identical" if cross == 16 else "FAIL - {} differ".format(16 - cross)
+    print("CORRECTNESS : {}".format(verdict))
+    print("=" * 72)
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vllm-bench-shared-prefix-cascade-pr
+  namespace: wdu-research
+spec:
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      priorityClassName: default-priority
+      containers:
+      - name: benchmark
+        image: vllm/vllm-openai:latest
+        resources:
+          limits:
+            nvidia.com/gpu: "1"
+            memory: 48Gi
+            cpu: "8"
+          requests:
+            nvidia.com/gpu: "1"
+            memory: 32Gi
+            cpu: "4"
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token-bench
+              key: token
+        - name: HUGGING_FACE_HUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token-bench
+              key: token
+        - name: HF_HOME
+          value: "/model-cache/huggingface"
+        - name: TRANSFORMERS_CACHE
+          value: "/model-cache/huggingface"
+        - name: HOME
+          value: "/tmp/vllm-home"
+        - name: XDG_CACHE_HOME
+          value: "/tmp/vllm-home/.cache"
+        - name: FLASHINFER_WORKSPACE_DIR
+          value: "/tmp/vllm-home/.cache/flashinfer"
+        - name: TRITON_CACHE_DIR
+          value: "/tmp/vllm-home/.cache/triton"
+        volumeMounts:
+        - name: model-cache
+          mountPath: /model-cache
+        - name: scripts
+          mountPath: /opt/bench-scripts
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -euo pipefail
+          RESULTS_DIR="/model-cache/foad/vllm-bench-shared-prefix-cascade-results"
+          MAIN_DIR="/tmp/vllm-main"
+          PR_DIR="/tmp/vllm-pr"
+          WORK_DIR="/tmp/vllm-work"
+          WORK_PKG="${WORK_DIR}/vllm"
+          MAIN_URL="https://github.com/masterFoad/vllm/archive/refs/heads/main.tar.gz"
+          PR_URL="https://github.com/masterFoad/vllm/archive/refs/heads/exp-shared-prefix-cascade-flashinfer.tar.gz"
+          mkdir -p "${RESULTS_DIR}" "${MAIN_DIR}" "${PR_DIR}" "${WORK_DIR}" \
+                   "${HOME}" "${XDG_CACHE_HOME}" "${FLASHINFER_WORKSPACE_DIR}" "${TRITON_CACHE_DIR}"
+
+          echo "======================================"
+          echo " Shared-prefix cascade benchmark"
+          echo " Branch: exp-shared-prefix-cascade-flashinfer"
+          echo "======================================"
+          nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+          python3 -c 'import torch; print("CUDA ok:", torch.cuda.get_device_name(0))'
+          VLLM_PATH=$(python3 -c 'import vllm, os; print(os.path.dirname(vllm.__file__))')
+          echo "Installed vllm: $(python3 -c 'import vllm; print(vllm.__version__)')"
+          echo "Package path:   ${VLLM_PATH}"
+
+          echo ""
+          echo ">>> Downloading branch tarballs in parallel ..."
+          curl -sL "${MAIN_URL}" | tar -xz -C "${MAIN_DIR}" --strip-components=1 &
+          curl -sL "${PR_URL}"   | tar -xz -C "${PR_DIR}"   --strip-components=1 &
+          wait
+          echo "Done."
+
+          echo ""
+          echo ">>> Building writable main-tree runtime overlay ..."
+          rm -rf "${WORK_PKG}"
+          cp -a "${MAIN_DIR}/vllm" "${WORK_PKG}"
+          python3 - "${VLLM_PATH}" "${WORK_PKG}" <<'PYEOF'
+          import os, shutil, sys
+          src, dst = sys.argv[1], sys.argv[2]
+          for root, dirs, files in os.walk(src):
+              rel_root = os.path.relpath(root, src)
+              for fname in files:
+                  if fname.endswith('.py') or fname.endswith('.bak'):
+                      continue
+                  s = os.path.join(root, fname)
+                  d = os.path.join(dst, rel_root, fname) if rel_root != '.' else os.path.join(dst, fname)
+                  os.makedirs(os.path.dirname(d), exist_ok=True)
+                  shutil.copy2(s, d)
+          print("Seeded runtime artifacts from installed package into", dst)
+          PYEOF
+
+          echo ""
+          echo ">>> Benchmark — main (FlashInfer forced, cascade disabled) ..."
+          unset VLLM_ENABLE_FLASHINFER_EXPERIMENTAL_CASCADE_ATTN
+          PYTHONPATH="${WORK_DIR}${PYTHONPATH:+:${PYTHONPATH}}" \
+            python3 /opt/bench-scripts/bench_e2e.py main "${RESULTS_DIR}"
+
+          echo ""
+          echo ">>> Applying PR changes to writable vllm copy ..."
+          python3 /opt/bench-scripts/patch_pr.py apply \
+            "${MAIN_DIR}/vllm" "${PR_DIR}/vllm" "${WORK_PKG}"
+
+          echo ""
+          echo ">>> Benchmark — PR branch (FlashInfer forced, experimental cascade enabled) ..."
+          export VLLM_ENABLE_FLASHINFER_EXPERIMENTAL_CASCADE_ATTN=1
+          PYTHONPATH="${WORK_DIR}${PYTHONPATH:+:${PYTHONPATH}}" \
+            python3 /opt/bench-scripts/bench_e2e.py optimized "${RESULTS_DIR}"
+
+          echo ""
+          python3 /opt/bench-scripts/compare.py "${RESULTS_DIR}"
+
+          echo ""
+          echo "Results saved to: ${RESULTS_DIR}/"
+          ls -lh "${RESULTS_DIR}/"
+      volumes:
+      - name: model-cache
+        persistentVolumeClaim:
+          claimName: model-cache-rwx
+      - name: scripts
+        configMap:
+          name: vllm-bench-shared-prefix-cascade-scripts

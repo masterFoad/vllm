@@ -1227,9 +1227,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # TODO: The cascade wrapper currently does not support setting
             # kv cache dtype to something different from query dtype.
             return False
-        # TODO: Cascade attention doesn't work, disable it for now
-        # return use_cascade_attention(*args, **kwargs)
-        return False
+        if not envs.VLLM_ENABLE_FLASHINFER_EXPERIMENTAL_CASCADE_ATTN:
+            # Keep the FlashInfer cascade path opt-in until it is better
+            # validated on correctness and performance.
+            return False
+        return use_cascade_attention(*args, **kwargs)
 
 
 class FlashInferImpl(AttentionImpl):

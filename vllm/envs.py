@@ -182,6 +182,7 @@ if TYPE_CHECKING:
     )
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
+    VLLM_ENABLE_FLASHINFER_EXPERIMENTAL_CASCADE_ATTN: bool = False
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
     VLLM_ALLOW_INSECURE_SERIALIZATION: bool = False
@@ -1385,6 +1386,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Control the workspace buffer size for the FlashInfer backend.
     "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": lambda: int(
         os.getenv("VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE", str(394 * 1024 * 1024))
+    ),
+    # Experimental: enable the dormant FlashInfer cascade-attention path.
+    # Keep this opt-in until correctness and performance are validated.
+    "VLLM_ENABLE_FLASHINFER_EXPERIMENTAL_CASCADE_ATTN": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_FLASHINFER_EXPERIMENTAL_CASCADE_ATTN", "0"))
     ),
     # Control the maximum number of tokens per expert supported by the
     # NVFP4 MoE CUTLASS Kernel. This value is used to create a buffer for

@@ -78,6 +78,20 @@ def test_getattr_with_reset(monkeypatch: pytest.MonkeyPatch) -> None:
     assert envs.VLLM_HOST_IP == "3.3.3.3"
 
 
+def test_flashinfer_experimental_cascade_attn_env(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv(
+        "VLLM_ENABLE_FLASHINFER_EXPERIMENTAL_CASCADE_ATTN", raising=False
+    )
+    if hasattr(envs.__getattr__, "cache_clear"):
+        envs.__getattr__.cache_clear()
+    assert envs.VLLM_ENABLE_FLASHINFER_EXPERIMENTAL_CASCADE_ATTN is False
+
+    monkeypatch.setenv("VLLM_ENABLE_FLASHINFER_EXPERIMENTAL_CASCADE_ATTN", "1")
+    if hasattr(envs.__getattr__, "cache_clear"):
+        envs.__getattr__.cache_clear()
+    assert envs.VLLM_ENABLE_FLASHINFER_EXPERIMENTAL_CASCADE_ATTN is True
+
+
 def test_is_envs_cache_enabled() -> None:
     assert not envs._is_envs_cache_enabled()
     enable_envs_cache()
