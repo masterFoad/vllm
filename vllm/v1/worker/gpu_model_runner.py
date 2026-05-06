@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -217,6 +218,123 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+
+_H2D_PREPARE_INPUTS_PROFILE_ENV = "H2D_PROFILE_PREPARE_INPUTS"
+_H2D_PREPARE_INPUTS_PROFILE_INTERVAL_ENV = "H2D_PROFILE_PREPARE_INPUTS_INTERVAL"
+
+
+def _h2d_profile_enabled() -> bool:
+    value = os.environ.get(_H2D_PREPARE_INPUTS_PROFILE_ENV, "")
+    return value.strip().lower() not in ("", "0", "false", "no", "off")
+
+
+class _PrepareInputsProfiler:
+    _ORDER = (
+        "update_states",
+        "num_scheduled_tokens_build",
+        "block_table_commit",
+        "req_indices_build",
+        "cumsum_query_pos",
+        "positions_np_build",
+        "token_indices_build",
+        "input_ids_cpu_gather",
+        "prompt_embeds_cpu",
+        "query_start_loc_prep",
+        "query_start_loc_copy",
+        "optimistic_seq_lens",
+        "prev_positions",
+        "discard_mask_copy",
+        "num_accepted_tokens_copy",
+        "num_computed_tokens_update",
+        "req_indices_copy",
+        "query_pos_copy",
+        "num_scheduled_tokens_copy",
+        "positions_seq_lens_gpu",
+        "slot_mapping_compute",
+        "input_ids_copy",
+        "rope_positions_copy",
+        "spec_decode_metadata",
+        "lora",
+        "_prepare_inputs_total",
+    )
+
+    def __init__(self, interval: int, rank: int) -> None:
+        self.interval = max(1, interval)
+        self.rank = rank
+        self.count = 0
+        self.total_reqs = 0
+        self.total_tokens = 0
+        self.totals_us = {name: 0.0 for name in self._ORDER}
+        self.max_us = {name: 0.0 for name in self._ORDER}
+
+    @classmethod
+    def from_env(cls, rank: int) -> "_PrepareInputsProfiler | None":
+        if not _h2d_profile_enabled():
+            return None
+        try:
+            interval = int(
+                os.environ.get(_H2D_PREPARE_INPUTS_PROFILE_INTERVAL_ENV, "50")
+            )
+        except ValueError:
+            interval = 50
+            logger.warning(
+                "Invalid %s value; using default interval %d",
+                _H2D_PREPARE_INPUTS_PROFILE_INTERVAL_ENV,
+                interval,
+            )
+        logger.info(
+            "Enabled H2D prepare_inputs profiling: %s=1, %s=%d",
+            _H2D_PREPARE_INPUTS_PROFILE_ENV,
+            _H2D_PREPARE_INPUTS_PROFILE_INTERVAL_ENV,
+            interval,
+        )
+        return cls(interval=interval, rank=rank)
+
+    @staticmethod
+    def start() -> float:
+        return time.perf_counter()
+
+    def record(self, name: str, start_time: float) -> None:
+        elapsed_us = (time.perf_counter() - start_time) * 1e6
+        self.totals_us[name] += elapsed_us
+        self.max_us[name] = max(self.max_us[name], elapsed_us)
+
+    def maybe_report(self, num_reqs: int, num_tokens: int) -> None:
+        self.count += 1
+        self.total_reqs += num_reqs
+        self.total_tokens += num_tokens
+        if self.count % self.interval == 0:
+            self.report_and_reset()
+
+    def report_and_reset(self) -> None:
+        if self.count == 0:
+            return
+        avg_us = {
+            name: round(self.totals_us[name] / self.count, 2)
+            for name in self._ORDER
+            if self.totals_us[name] > 0.0
+        }
+        max_us = {
+            name: round(self.max_us[name], 2)
+            for name in self._ORDER
+            if self.max_us[name] > 0.0
+        }
+        logger.info(
+            "h2d prepare_inputs profile rank=%d batches=%d avg_reqs=%.2f "
+            "avg_tokens=%.2f avg_us=%s max_us=%s",
+            self.rank,
+            self.count,
+            self.total_reqs / self.count,
+            self.total_tokens / self.count,
+            avg_us,
+            max_us,
+        )
+        self.count = 0
+        self.total_reqs = 0
+        self.total_tokens = 0
+        for name in self._ORDER:
+            self.totals_us[name] = 0.0
+            self.max_us[name] = 0.0
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -438,6 +556,9 @@ class GPUModelRunner(
 
         # Always set to false after the first forward pass
         self.calculate_kv_scales = self.cache_config.calculate_kv_scales
+        self.prepare_inputs_profiler = _PrepareInputsProfiler.from_env(
+            parallel_config.data_parallel_rank
+        )
         self.dcp_world_size = self.parallel_config.decode_context_parallel_size
         self.dcp_rank = 0 if self.dcp_world_size <= 1 else get_dcp_group().rank_in_group
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
@@ -1786,6 +1907,11 @@ class GPUModelRunner(
             logits_indices, spec_decode_metadata,
         ]
         """
+        profiler = self.prepare_inputs_profiler
+        total_start = 0.0
+        if profiler is not None:
+            total_start = profiler.start()
+
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
@@ -1793,23 +1919,39 @@ class GPUModelRunner(
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
+        if profiler is not None:
+            step_start = profiler.start()
         self.input_batch.block_table.commit_block_table(num_reqs)
+        if profiler is not None:
+            profiler.record("block_table_commit", step_start)
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
+        if profiler is not None:
+            step_start = profiler.start()
         req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
+        if profiler is not None:
+            profiler.record("req_indices_build", step_start)
 
         # cu_num_tokens: [2, 5, 3] -> [2, 7, 10]
         # self.query_pos.np[:10]: [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+        if profiler is not None:
+            step_start = profiler.start()
         cu_num_tokens = self._get_cumsum_and_arange(
             num_scheduled_tokens, self.query_pos.np
         )
+        if profiler is not None:
+            profiler.record("cumsum_query_pos", step_start)
 
         # Get positions.
+        if profiler is not None:
+            step_start = profiler.start()
         positions_np = (
             self.input_batch.num_computed_tokens_cpu[req_indices]
             + self.query_pos.np[: cu_num_tokens[-1]]
         )
+        if profiler is not None:
+            profiler.record("positions_np_build", step_start)
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -1825,14 +1967,20 @@ class GPUModelRunner(
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
         # where M is the max_model_len.
+        if profiler is not None:
+            step_start = profiler.start()
         token_indices = (
             positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
         )
         token_indices_tensor = torch.from_numpy(token_indices)
+        if profiler is not None:
+            profiler.record("token_indices_build", step_start)
 
         # NOTE(woosuk): We use torch.index_select instead of np.take here
         # because torch.index_select is much faster than np.take for large
         # tensors.
+        if profiler is not None:
+            step_start = profiler.start()
         torch.index_select(
             self.input_batch.token_ids_cpu_tensor.flatten(),
             0,
@@ -1847,11 +1995,15 @@ class GPUModelRunner(
                 token_indices_tensor,
                 out=self.is_token_ids.cpu[:total_num_scheduled_tokens],
             )
+        if profiler is not None:
+            profiler.record("input_ids_cpu_gather", step_start)
 
         # Because we did not pre-allocate a massive prompt_embeds CPU tensor on
         # the InputBatch, we need to fill in the prompt embeds into the expected
         # spots in the GpuModelRunner's pre-allocated prompt_embeds tensor.
         if self.input_batch.req_prompt_embeds:
+            if profiler is not None:
+                step_start = profiler.start()
             output_idx = 0
             for req_idx in range(num_reqs):
                 num_sched = num_scheduled_tokens[req_idx]
@@ -1885,32 +2037,53 @@ class GPUModelRunner(
                     ].copy_(req_embeds[start_pos:actual_end])
 
                 output_idx += num_sched
+            if profiler is not None:
+                profiler.record("prompt_embeds_cpu", step_start)
 
         # Prepare the attention metadata.
+        if profiler is not None:
+            step_start = profiler.start()
         self.query_start_loc.np[0] = 0
         self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
         # Note: pad query_start_loc to be non-decreasing, as kernels
         # like FlashAttention requires that
         self.query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
+        if profiler is not None:
+            profiler.record("query_start_loc_prep", step_start)
+
+        if profiler is not None:
+            step_start = profiler.start()
         self.query_start_loc.copy_to_gpu()
         query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
+        if profiler is not None:
+            profiler.record("query_start_loc_copy", step_start)
 
         # Compute optimistic seq_lens (assumes all draft tokens from previous
         # iteration accepted). Store in optimistic_seq_lens_cpu for use by
         # _build_attention_metadata (max_seq_len) and discard_request_mask.
         # seq_lens (GPU) will be computed later using the same optimistic values.
+        if profiler is not None:
+            step_start = profiler.start()
         torch.add(
             self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
             torch.from_numpy(num_scheduled_tokens),
             out=self.optimistic_seq_lens_cpu[:num_reqs],
         )
         self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
+        if profiler is not None:
+            profiler.record("optimistic_seq_lens", step_start)
 
         # Build prev_positions mapping: current pos -> prev pos (-1 if new).
         # Used for gathering from previous iteration's GPU tensors.
         prev_req_id_to_index = self.input_batch.prev_req_id_to_index
+        if profiler is not None:
+            step_start = profiler.start()
         self._compute_prev_positions(num_reqs)
+        if profiler is not None:
+            profiler.record("prev_positions", step_start)
 
+        if profiler is not None:
+            step_start = profiler.start()
         num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
         num_tokens_np = np.array(num_tokens, dtype=np.int32)
 
@@ -1920,9 +2093,13 @@ class GPUModelRunner(
             self.optimistic_seq_lens_cpu[:num_reqs].numpy() < num_tokens_np
         )
         self.discard_request_mask.copy_to_gpu(num_reqs)
+        if profiler is not None:
+            profiler.record("discard_mask_copy", step_start)
 
         # Sync num_accepted_tokens from CPU (set by
         # _update_states_after_model_execute for hybrid models).
+        if profiler is not None:
+            step_start = profiler.start()
         if self.num_accepted_tokens_event is not None:
             self.num_accepted_tokens_event.synchronize()
             # Async mode: condense() reordered indices, use prev_positions mapping
@@ -1948,11 +2125,15 @@ class GPUModelRunner(
         else:
             self.num_accepted_tokens.np.fill(1)
             self.num_accepted_tokens.gpu.fill_(1)
+        if profiler is not None:
+            profiler.record("num_accepted_tokens_copy", step_start)
 
         # Update num_computed_tokens on GPU. In async spec decode,
         # CPU values are optimistic (all drafts accepted). The kernel
         # corrects on GPU using the previous step's
         # valid_sampled_token_count_gpu. Otherwise, just copy from CPU.
+        if profiler is not None:
+            step_start = profiler.start()
         if (
             self.use_async_spec_decode
             and self.valid_sampled_token_count_gpu is not None
@@ -1976,15 +2157,33 @@ class GPUModelRunner(
                 self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
                 non_blocking=True,
             )
+        if profiler is not None:
+            profiler.record("num_computed_tokens_update", step_start)
 
+        if profiler is not None:
+            step_start = profiler.start()
         self.req_indices.np[:total_num_scheduled_tokens] = req_indices
         self.req_indices.copy_to_gpu(total_num_scheduled_tokens)
         req_indices_gpu = self.req_indices.gpu[:total_num_scheduled_tokens]
+        if profiler is not None:
+            profiler.record("req_indices_copy", step_start)
 
+        if profiler is not None:
+            step_start = profiler.start()
         self.query_pos.copy_to_gpu(total_num_scheduled_tokens)
+        if profiler is not None:
+            profiler.record("query_pos_copy", step_start)
+
+        if profiler is not None:
+            step_start = profiler.start()
         self.num_scheduled_tokens.np[:num_reqs] = num_scheduled_tokens
         self.num_scheduled_tokens.copy_to_gpu(num_reqs)
         num_scheduled_tokens_gpu = self.num_scheduled_tokens.gpu[:num_reqs]
+        if profiler is not None:
+            profiler.record("num_scheduled_tokens_copy", step_start)
+
+        if profiler is not None:
+            step_start = profiler.start()
         self.positions[:total_num_scheduled_tokens] = (
             self.num_computed_tokens[req_indices_gpu].to(torch.int64)
             + self.query_pos.gpu[:total_num_scheduled_tokens]
@@ -1993,34 +2192,54 @@ class GPUModelRunner(
             self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
         )
         self.seq_lens[num_reqs:].fill_(0)
+        if profiler is not None:
+            profiler.record("positions_seq_lens_gpu", step_start)
 
+        if profiler is not None:
+            step_start = profiler.start()
         self.input_batch.block_table.compute_slot_mapping(
             num_reqs,
             self.query_start_loc.gpu[: num_reqs + 1],
             self.positions[:total_num_scheduled_tokens],
         )
+        if profiler is not None:
+            profiler.record("slot_mapping_compute", step_start)
 
         # Copy the tensors to the GPU.
+        if profiler is not None:
+            step_start = profiler.start()
         self._prepare_input_ids(
             scheduler_output,
             num_reqs,
             total_num_scheduled_tokens,
             cu_num_tokens,
         )
+        if profiler is not None:
+            profiler.record("input_ids_copy", step_start)
 
         if self.uses_mrope:
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
+            if profiler is not None:
+                step_start = profiler.start()
             self.mrope_positions.gpu[:, :total_num_scheduled_tokens].copy_(
                 self.mrope_positions.cpu[:, :total_num_scheduled_tokens],
                 non_blocking=True,
             )
+            if profiler is not None:
+                profiler.record("rope_positions_copy", step_start)
         elif self.uses_xdrope_dim > 0:
             # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
+            if profiler is not None:
+                step_start = profiler.start()
             self.xdrope_positions.gpu[:, :total_num_scheduled_tokens].copy_(
                 self.xdrope_positions.cpu[:, :total_num_scheduled_tokens],
                 non_blocking=True,
             )
+            if profiler is not None:
+                profiler.record("rope_positions_copy", step_start)
         if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
+            if profiler is not None:
+                step_start = profiler.start()
             drift = self.num_computed_tokens[req_indices_gpu].to(
                 torch.int64
             ) - self.input_batch.num_computed_tokens_cpu_tensor[req_indices].to(
@@ -2028,7 +2247,11 @@ class GPUModelRunner(
             )
             target = self.mrope_positions if self.uses_mrope else self.xdrope_positions
             target.gpu[:, :total_num_scheduled_tokens] += drift
+            if profiler is not None:
+                profiler.record("rope_positions_copy", step_start)
 
+        if profiler is not None:
+            step_start = profiler.start()
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
         if not use_spec_decode:
             # NOTE(woosuk): Due to chunked prefills, the batch may contain
@@ -2068,15 +2291,27 @@ class GPUModelRunner(
             self.num_decode_draft_tokens.np[:num_reqs] = num_decode_draft_tokens
             self.num_decode_draft_tokens.np[num_reqs:].fill(-1)
             self.num_decode_draft_tokens.copy_to_gpu()
+        if profiler is not None:
+            profiler.record("spec_decode_metadata", step_start)
 
         # Hot-Swap lora model
         if self.lora_config:
+            if profiler is not None:
+                step_start = profiler.start()
             assert (
                 np.sum(num_sampled_tokens)
                 <= self.vllm_config.scheduler_config.max_num_batched_tokens
             )
             self.set_active_loras(
                 self.input_batch, num_scheduled_tokens, num_sampled_tokens
+            )
+            if profiler is not None:
+                profiler.record("lora", step_start)
+
+        if profiler is not None:
+            profiler.record("_prepare_inputs_total", total_start)
+            profiler.maybe_report(
+                num_reqs=num_reqs, num_tokens=total_num_scheduled_tokens
             )
 
         return (
@@ -3829,8 +4064,14 @@ class GPUModelRunner(
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
+            profiler = self.prepare_inputs_profiler
+
             # Update persistent batch states.
+            if profiler is not None:
+                step_start = profiler.start()
             deferred_state_corrections_fn = self._update_states(scheduler_output)
+            if profiler is not None:
+                profiler.record("update_states", step_start)
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -3865,12 +4106,16 @@ class GPUModelRunner(
                     "it when the requests need prompt logprobs"
                 )
 
+            if profiler is not None:
+                step_start = profiler.start()
             num_reqs = self.input_batch.num_reqs
             req_ids = self.input_batch.req_ids
             tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+            if profiler is not None:
+                profiler.record("num_scheduled_tokens_build", step_start)
 
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
