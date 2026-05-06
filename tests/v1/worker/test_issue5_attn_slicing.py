@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import numpy as np
 import pytest
 import torch
 
@@ -9,8 +10,41 @@ from vllm.v1.worker.gpu.input_batch import (
     expand_idx_mapping,
     prepare_pos_seq_lens,
 )
+from vllm.v1.worker.gpu.states import RequestState
 
 CUDA_ONLY = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+
+
+def test_input_buffers_cpu_views_share_storage() -> None:
+    input_buffers = InputBuffers(
+        max_num_reqs=8,
+        max_num_tokens=64,
+        device=torch.device("cpu"),
+    )
+
+    input_buffers.idx_mapping_np[:3] = [4, 2, 7]
+    assert torch.equal(
+        input_buffers.idx_mapping_cpu[:3],
+        torch.tensor([4, 2, 7], dtype=torch.int32),
+    )
+
+    input_buffers.cu_num_logits_np[:4] = [0, 2, 3, 6]
+    assert torch.equal(
+        input_buffers.cu_num_logits_cpu[:4],
+        torch.tensor([0, 2, 3, 6], dtype=torch.int32),
+    )
+
+    input_buffers.query_start_loc_np[:4] = [0, 5, 9, 12]
+    assert torch.equal(
+        input_buffers.query_start_loc_cpu[:4],
+        torch.tensor([0, 5, 9, 12], dtype=torch.int32),
+    )
+
+    input_buffers.seq_lens_cpu_upper_bound_np[:3] = [11, 12, 13]
+    assert torch.equal(
+        input_buffers.seq_lens_cpu_upper_bound_cpu[:3],
+        torch.tensor([11, 12, 13], dtype=torch.int32),
+    )
 
 
 @CUDA_ONLY
@@ -127,3 +161,30 @@ def test_combine_sampled_and_draft_tokens_validates_output_capacity() -> None:
             num_logits=2,
             logits_indices=torch.empty(1, dtype=torch.int64),
         )
+
+
+@CUDA_ONLY
+def test_request_state_any_prefills_matches_expected_and_reuses_scratch() -> None:
+    req_states = RequestState(
+        max_num_reqs=8,
+        max_model_len=32,
+        max_num_batched_tokens=32,
+        num_speculative_steps=2,
+        vocab_size=128,
+        device=torch.device("cuda"),
+    )
+    req_states.num_computed_prefill_tokens[:] = np.array(
+        [0, 4, 3, 10, 1, 8, 2, 7], dtype=np.int32
+    )
+    req_states.prefill_len.np[:] = np.array(
+        [1, 4, 5, 10, 1, 8, 2, 7], dtype=np.int32
+    )
+
+    active = np.array([0, 1, 2, 3], dtype=np.int32)
+    assert req_states.any_prefills(active)
+
+    smaller = np.array([4, 5, 6, 7], dtype=np.int32)
+    assert not req_states.any_prefills(smaller)
+
+    mixed = np.array([2, 5], dtype=np.int32)
+    assert req_states.any_prefills(mixed)

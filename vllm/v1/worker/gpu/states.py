@@ -59,6 +59,12 @@ class RequestState:
         )
         # Optimistic CPU mirror of num_computed_tokens (upper bound on GPU value).
         self.num_computed_tokens_np = np.zeros(self.max_num_reqs, dtype=np.int32)
+        self.any_prefills_num_computed_scratch = np.empty(
+            self.max_num_reqs, dtype=np.int32
+        )
+        self.any_prefills_prefill_len_scratch = np.empty(
+            self.max_num_reqs, dtype=np.int32
+        )
 
         # Last sampled tokens.
         self.last_sampled_tokens = torch.zeros(
@@ -135,7 +141,9 @@ class RequestState:
         return True
 
     def any_prefills(self, idx_mapping_np: np.ndarray) -> bool:
-        return np.any(
-            self.num_computed_prefill_tokens[idx_mapping_np]
-            < self.prefill_len.np[idx_mapping_np]
-        )
+        num_reqs = len(idx_mapping_np)
+        num_computed = self.any_prefills_num_computed_scratch[:num_reqs]
+        prefill_len = self.any_prefills_prefill_len_scratch[:num_reqs]
+        np.take(self.num_computed_prefill_tokens, idx_mapping_np, out=num_computed)
+        np.take(self.prefill_len.np, idx_mapping_np, out=prefill_len)
+        return np.any(num_computed < prefill_len)

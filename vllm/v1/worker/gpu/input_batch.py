@@ -33,14 +33,17 @@ class InputBuffers:
 
         # Persistent CPU/GPU buffers for prepare_inputs
         self.idx_mapping_np = np.empty(max_num_reqs, dtype=np.int32)
+        self.idx_mapping_cpu = torch.from_numpy(self.idx_mapping_np)
         self.idx_mapping = torch.empty(max_num_reqs, dtype=torch.int32, device=device)
 
         self.cu_num_logits_np = np.empty(max_num_reqs + 1, dtype=np.int32)
+        self.cu_num_logits_cpu = torch.from_numpy(self.cu_num_logits_np)
         self.cu_num_logits = torch.empty(
             max_num_reqs + 1, dtype=torch.int32, device=device
         )
 
         self.query_start_loc_np = np.empty(max_num_reqs + 1, dtype=np.int32)
+        self.query_start_loc_cpu = torch.from_numpy(self.query_start_loc_np)
 
         self.expanded_idx_mapping = torch.empty(
             max_num_tokens, dtype=torch.int32, device=device
@@ -61,6 +64,11 @@ class InputBuffers:
         self.arange_num_reqs_np = np.arange(max_num_reqs + 1, dtype=np.int32)
         self.zeros_num_reqs = torch.zeros(
             max_num_reqs, dtype=torch.int32, device=device
+        )
+
+        self.seq_lens_cpu_upper_bound_np = np.empty(max_num_reqs, dtype=np.int32)
+        self.seq_lens_cpu_upper_bound_cpu = torch.from_numpy(
+            self.seq_lens_cpu_upper_bound_np
         )
 
 
@@ -155,7 +163,11 @@ class InputBatch:
         cu_num_logits = input_buffers.arange_num_reqs[: num_reqs + 1]
         cu_num_logits_np = input_buffers.arange_num_reqs_np[: num_reqs + 1]
         # Dummy: seq_len == query_len (fresh-prefill shape).
-        seq_lens_cpu_upper_bound = torch.from_numpy(num_scheduled_tokens.copy())
+        seq_lens_cpu_upper_bound_np = input_buffers.seq_lens_cpu_upper_bound_np[
+            :num_reqs
+        ]
+        seq_lens_cpu_upper_bound_np[:] = num_scheduled_tokens
+        seq_lens_cpu_upper_bound = input_buffers.seq_lens_cpu_upper_bound_cpu[:num_reqs]
         return cls(
             req_ids=req_ids,
             num_reqs=num_reqs,

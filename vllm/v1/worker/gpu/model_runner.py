@@ -57,7 +57,6 @@ from vllm.v1.worker.gpu.attn_utils import (
     init_kv_cache,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
@@ -714,8 +713,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         idx_mapping_np[:] = np.fromiter(
             idx_mapping_iter, dtype=np.int32, count=num_reqs
         )
+        idx_mapping_cpu = self.input_buffers.idx_mapping_cpu[:num_reqs]
         idx_mapping = self.input_buffers.idx_mapping[:num_reqs]
-        async_copy_to_gpu(idx_mapping_np, out=idx_mapping)
+        idx_mapping.copy_(idx_mapping_cpu, non_blocking=True)
 
         # Get the number of draft tokens for each request.
         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
@@ -740,8 +740,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cu_num_logits_np = self.input_buffers.cu_num_logits_np[: num_reqs + 1]
             cu_num_logits_np[0] = 0
             np.cumsum(num_logits, out=cu_num_logits_np[1:])
+            cu_num_logits_cpu = self.input_buffers.cu_num_logits_cpu[: num_reqs + 1]
             cu_num_logits = self.input_buffers.cu_num_logits[: num_reqs + 1]
-            async_copy_to_gpu(cu_num_logits_np, out=cu_num_logits)
+            cu_num_logits.copy_(cu_num_logits_cpu, non_blocking=True)
 
             max_expand_len = self.num_speculative_steps + 1
             expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
@@ -765,8 +766,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Some attention backends like FA3 require query_start_loc to be non-decreasing.
         if num_reqs_padded > num_reqs:
             query_start_loc_np[num_reqs + 1 :] = num_tokens
+        query_start_loc_cpu = self.input_buffers.query_start_loc_cpu[
+            : num_reqs_padded + 1
+        ]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]
-        async_copy_to_gpu(query_start_loc_np, out=query_start_loc)
+        query_start_loc.copy_(query_start_loc_cpu, non_blocking=True)
 
         # Get prefill tokens if any.
         if self.req_states.any_prefills(idx_mapping_np):
@@ -819,13 +823,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         # CPU upper bound on seq_lens; padded entries left at zero.
-        seq_lens_cpu_upper_bound_np = np.zeros(num_reqs_padded, dtype=np.int32)
+        seq_lens_cpu_upper_bound_np = self.input_buffers.seq_lens_cpu_upper_bound_np[
+            :num_reqs_padded
+        ]
+        np.take(
+            self.req_states.num_computed_tokens_np,
+            idx_mapping_np,
+            out=seq_lens_cpu_upper_bound_np[:num_reqs],
+        )
         np.add(
-            self.req_states.num_computed_tokens_np[idx_mapping_np],
+            seq_lens_cpu_upper_bound_np[:num_reqs],
             num_scheduled_tokens,
             out=seq_lens_cpu_upper_bound_np[:num_reqs],
         )
-        seq_lens_cpu_upper_bound = torch.from_numpy(seq_lens_cpu_upper_bound_np)
+        if num_reqs_padded > num_reqs:
+            seq_lens_cpu_upper_bound_np[num_reqs:] = 0
+        seq_lens_cpu_upper_bound = self.input_buffers.seq_lens_cpu_upper_bound_cpu[
+            :num_reqs_padded
+        ]
         return InputBatch(
             req_ids=req_ids,
             num_reqs=num_reqs,
