@@ -279,6 +279,48 @@ class MultiGroupBlockTable:
                 block_sizes, kernel_block_sizes, max_num_blocks
             )
         ]
+        self.num_kv_cache_groups = len(self.block_tables)
+        self.max_num_batched_tokens = max_num_batched_tokens
+
+        first_block_table = self.block_tables[0]
+        self.total_cp_world_size = (
+            first_block_table.pcp_world_size * first_block_table.dcp_world_size
+        )
+        self.total_cp_rank = (
+            first_block_table.pcp_rank * first_block_table.dcp_world_size
+            + first_block_table.dcp_rank
+        )
+        self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
+
+        self.block_table_ptrs = torch.tensor(
+            [
+                block_table.block_table.gpu.data_ptr()
+                for block_table in self.block_tables
+            ],
+            dtype=torch.uint64,
+            device=device,
+        )
+        self.block_table_strides = torch.tensor(
+            [
+                block_table.block_table.gpu.stride(0)
+                for block_table in self.block_tables
+            ],
+            dtype=torch.int64,
+            device=device,
+        )
+        self.block_sizes = torch.tensor(
+            [block_table.block_size for block_table in self.block_tables],
+            dtype=torch.int32,
+            device=device,
+        )
+        self.slot_mapping_ptrs = torch.tensor(
+            [
+                block_table.slot_mapping.gpu.data_ptr()
+                for block_table in self.block_tables
+            ],
+            dtype=torch.uint64,
+            device=device,
+        )
 
     def append_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
         for i, block_table in enumerate(self.block_tables):
@@ -306,8 +348,29 @@ class MultiGroupBlockTable:
         query_start_loc: torch.Tensor,
         positions: torch.Tensor,
     ) -> None:
-        for block_table in self.block_tables:
-            block_table.compute_slot_mapping(num_reqs, query_start_loc, positions)
+        if self.num_kv_cache_groups == 1:
+            self.block_tables[0].compute_slot_mapping(
+                num_reqs, query_start_loc, positions
+            )
+            return
+
+        _compute_multi_group_slot_mapping_kernel[
+            (self.num_kv_cache_groups, num_reqs + 1)
+        ](
+            positions.shape[0],
+            self.max_num_batched_tokens,
+            query_start_loc,
+            positions,
+            self.block_table_ptrs,
+            self.block_table_strides,
+            self.block_sizes,
+            self.slot_mapping_ptrs,
+            TOTAL_CP_WORLD_SIZE=self.total_cp_world_size,
+            TOTAL_CP_RANK=self.total_cp_rank,
+            CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,
+            PAD_ID=PAD_SLOT_ID,
+            BLOCK_SIZE=1024,
+        )
 
     def commit_block_table(self, num_reqs: int) -> None:
         for block_table in self.block_tables:
@@ -378,3 +441,74 @@ def _compute_slot_mapping_kernel(
         slot_ids = block_numbers * block_size + local_block_offsets
         slot_ids = tl.where(is_local, slot_ids, PAD_ID)
         tl.store(slot_mapping_ptr + offsets, slot_ids, mask=mask)
+
+
+@triton.jit
+def _compute_multi_group_slot_mapping_kernel(
+    num_tokens,
+    max_num_tokens,
+    query_start_loc_ptr,  # [num_reqs + 1], int32
+    positions_ptr,  # [num_tokens], int64
+    block_table_ptrs,  # [num_kv_cache_groups], uint64
+    block_table_strides,  # [num_kv_cache_groups], int64
+    block_sizes,  # [num_kv_cache_groups], int32
+    slot_mapping_ptrs,  # [num_kv_cache_groups], uint64
+    TOTAL_CP_WORLD_SIZE: tl.constexpr,
+    TOTAL_CP_RANK: tl.constexpr,
+    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
+    PAD_ID: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    group_idx = tl.program_id(0)
+    req_idx = tl.program_id(1)
+
+    slot_mapping_ptr = _load_ptr(slot_mapping_ptrs + group_idx, tl.int64)
+    if req_idx == tl.num_programs(1) - 1:
+        # Pad remaining slots for CUDA graph compatibility.
+        for i in range(num_tokens, max_num_tokens, BLOCK_SIZE):
+            offsets = i + tl.arange(0, BLOCK_SIZE)
+            tl.store(
+                slot_mapping_ptr + offsets,
+                PAD_ID,
+                mask=offsets < max_num_tokens,
+            )
+        return
+
+    block_table_ptr = _load_ptr(block_table_ptrs + group_idx, tl.int32)
+    block_table_stride = tl.load(block_table_strides + group_idx)
+    block_size = tl.load(block_sizes + group_idx)
+
+    start_idx = tl.load(query_start_loc_ptr + req_idx).to(tl.int64)
+    end_idx = tl.load(query_start_loc_ptr + req_idx + 1).to(tl.int64)
+
+    virtual_block_size = block_size * TOTAL_CP_WORLD_SIZE
+    row_offset = req_idx * block_table_stride
+    for i in range(start_idx, end_idx, BLOCK_SIZE):
+        offsets = i + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < end_idx
+        pos = tl.load(positions_ptr + offsets, mask=mask, other=0)
+        block_indices = pos // virtual_block_size
+        block_numbers = tl.load(block_table_ptr + row_offset + block_indices).to(
+            tl.int64
+        )
+
+        virtual_block_offsets = pos - block_indices * virtual_block_size
+        is_local = (
+            virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
+        ) % TOTAL_CP_WORLD_SIZE == TOTAL_CP_RANK
+        local_block_offsets = (
+            virtual_block_offsets // (TOTAL_CP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
+        ) * CP_KV_CACHE_INTERLEAVE_SIZE + (
+            virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
+        )
+
+        slot_ids = block_numbers * block_size + local_block_offsets
+        slot_ids = tl.where(is_local, slot_ids, PAD_ID)
+        tl.store(slot_mapping_ptr + offsets, slot_ids, mask=mask)
+
+
+@triton.jit
+def _load_ptr(ptr_to_ptr, elem_dtype):
+    ptr = tl.load(ptr_to_ptr)
+    ptr = tl.cast(ptr, tl.pointer_type(elem_dtype))
+    return tl.multiple_of(ptr, 16)
