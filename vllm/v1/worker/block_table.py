@@ -282,6 +282,7 @@ class MultiGroupBlockTable:
         self.num_kv_cache_groups = len(self.block_tables)
         self.max_num_batched_tokens = max_num_batched_tokens
         self._logged_slot_mapping_path = False
+        self._slot_mapping_path = "unseen"
 
         first_block_table = self.block_tables[0]
         self.total_cp_world_size = (
@@ -366,6 +367,7 @@ class MultiGroupBlockTable:
                     positions.shape[0],
                 )
                 self._logged_slot_mapping_path = True
+            self._slot_mapping_path = "single_group"
             self.block_tables[0].compute_slot_mapping(
                 num_reqs, query_start_loc, positions
             )
@@ -380,6 +382,7 @@ class MultiGroupBlockTable:
                 positions.shape[0],
             )
             self._logged_slot_mapping_path = True
+        self._slot_mapping_path = "fused_multi_group"
 
         _compute_multi_group_slot_mapping_kernel[
             (self.num_kv_cache_groups, num_reqs + 1)
