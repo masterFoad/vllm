@@ -281,6 +281,7 @@ class MultiGroupBlockTable:
         ]
         self.num_kv_cache_groups = len(self.block_tables)
         self.max_num_batched_tokens = max_num_batched_tokens
+        self._logged_slot_mapping_path = False
 
         first_block_table = self.block_tables[0]
         self.total_cp_world_size = (
@@ -321,6 +322,14 @@ class MultiGroupBlockTable:
             dtype=torch.uint64,
             device=device,
         )
+        logger.info(
+            "AH003_SLOT_MAPPING_INIT num_kv_cache_groups=%d block_sizes=%s "
+            "kernel_block_sizes=%s max_num_blocks=%s",
+            self.num_kv_cache_groups,
+            block_sizes,
+            kernel_block_sizes,
+            max_num_blocks,
+        )
 
     def append_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
         for i, block_table in enumerate(self.block_tables):
@@ -349,10 +358,28 @@ class MultiGroupBlockTable:
         positions: torch.Tensor,
     ) -> None:
         if self.num_kv_cache_groups == 1:
+            if not self._logged_slot_mapping_path:
+                logger.info(
+                    "AH003_SLOT_MAPPING_PATH path=single_group "
+                    "num_kv_cache_groups=1 num_reqs=%d num_tokens=%d",
+                    num_reqs,
+                    positions.shape[0],
+                )
+                self._logged_slot_mapping_path = True
             self.block_tables[0].compute_slot_mapping(
                 num_reqs, query_start_loc, positions
             )
             return
+
+        if not self._logged_slot_mapping_path:
+            logger.info(
+                "AH003_SLOT_MAPPING_PATH path=fused_multi_group "
+                "num_kv_cache_groups=%d num_reqs=%d num_tokens=%d",
+                self.num_kv_cache_groups,
+                num_reqs,
+                positions.shape[0],
+            )
+            self._logged_slot_mapping_path = True
 
         _compute_multi_group_slot_mapping_kernel[
             (self.num_kv_cache_groups, num_reqs + 1)
