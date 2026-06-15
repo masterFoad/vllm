@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton helpers for DiffusionGemma fused vocab reductions.
 
-This module is intentionally not wired into serving yet. It is the first
-single-rank Tier-2 building block: stream ``hidden @ lm_head`` over vocab tiles,
-apply DiffusionGemma final-logit softcap, and compute row-wise logsumexp without
-materializing full ``[rows, vocab]`` logits.
+This module is intentionally not wired into serving yet. It is a single-rank
+Tier-2 building block: stream ``hidden @ lm_head`` over vocab tiles, apply
+DiffusionGemma final-logit softcap, and compute row-wise sampler reductions
+without materializing full ``[rows, vocab]`` logits.
 """
 
 from __future__ import annotations
@@ -23,11 +23,14 @@ _DEFAULT_NUM_WARPS = 8
 
 
 @triton.jit
-def _softcap_lse_partial_kernel(
+def _softcap_reduce_partial_kernel(
     hidden: torch.Tensor,
     weight: torch.Tensor,
     partial_max: torch.Tensor,
     partial_denom: torch.Tensor,
+    partial_expected: torch.Tensor,
+    partial_argmax_value: torch.Tensor,
+    partial_argmax_token: torch.Tensor,
     rows: tl.constexpr,
     hidden_size: tl.constexpr,
     vocab_size: tl.constexpr,
@@ -66,21 +69,30 @@ def _softcap_lse_partial_kernel(
     z = acc / softcap
     scaled = ((2.0 / (1.0 + tl.exp(-2.0 * z))) - 1.0) * softcap
     scaled = scaled / temperature
-    scaled = tl.where(
-        (row_offsets[:, None] < rows) & (vocab_offsets[None, :] < vocab_size),
-        scaled,
-        -float("inf"),
-    )
+    valid = (row_offsets[:, None] < rows) & (vocab_offsets[None, :] < vocab_size)
+    scaled = tl.where(valid, scaled, -float("inf"))
 
     tile_max = tl.max(scaled, axis=1)
-    tile_denom = tl.sum(tl.exp(scaled - tile_max[:, None]), axis=1)
+    weights = tl.exp(scaled - tile_max[:, None])
+    tile_denom = tl.sum(weights, axis=1)
+    scaled_for_expected = tl.where(valid, scaled, 0.0)
+    tile_expected = tl.sum(weights * scaled_for_expected, axis=1)
+
+    max_token_candidates = tl.where(
+        scaled == tile_max[:, None], vocab_offsets[None, :], vocab_size
+    )
+    tile_argmax_token = tl.min(max_token_candidates, axis=1)
 
     out_offsets = row_offsets * num_vocab_blocks + vocab_block
-    tl.store(partial_max + out_offsets, tile_max, mask=row_offsets < rows)
-    tl.store(partial_denom + out_offsets, tile_denom, mask=row_offsets < rows)
+    row_mask = row_offsets < rows
+    tl.store(partial_max + out_offsets, tile_max, mask=row_mask)
+    tl.store(partial_denom + out_offsets, tile_denom, mask=row_mask)
+    tl.store(partial_expected + out_offsets, tile_expected, mask=row_mask)
+    tl.store(partial_argmax_value + out_offsets, tile_max, mask=row_mask)
+    tl.store(partial_argmax_token + out_offsets, tile_argmax_token, mask=row_mask)
 
 
-def diffusion_gemma_softcap_lse(
+def diffusion_gemma_softcap_lse_entropy_argmax(
     hidden: torch.Tensor,
     weight: torch.Tensor,
     softcap: float,
@@ -90,8 +102,8 @@ def diffusion_gemma_softcap_lse(
     block_n: int = _DEFAULT_BLOCK_N,
     block_k: int = _DEFAULT_BLOCK_K,
     num_warps: int = _DEFAULT_NUM_WARPS,
-) -> torch.Tensor:
-    """Compute row-wise softcapped lm-head logsumexp without full logits.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute softcapped lm-head LSE, entropy, and greedy argmax.
 
     Args:
         hidden: ``[rows, hidden_size]`` CUDA tensor.
@@ -104,7 +116,8 @@ def diffusion_gemma_softcap_lse(
         num_warps: Triton kernel warp count.
 
     Returns:
-        ``[rows]`` fp32 logsumexp values.
+        Tuple of ``[rows]`` fp32 logsumexp, ``[rows]`` fp32 entropy, and
+        ``[rows]`` int64 greedy-token ids.
     """
     if hidden.ndim != 2 or weight.ndim != 2:
         raise ValueError("hidden and weight must be rank-2 tensors")
@@ -121,21 +134,32 @@ def diffusion_gemma_softcap_lse(
     weight = weight.contiguous()
     rows, hidden_size = hidden.shape
     vocab_size = weight.shape[0]
+    if vocab_size == 0:
+        raise ValueError("weight must have at least one vocab row")
     if rows == 0:
-        return torch.empty((0,), device=hidden.device, dtype=torch.float32)
+        empty = torch.empty((0,), device=hidden.device, dtype=torch.float32)
+        empty_tokens = torch.empty((0,), device=hidden.device, dtype=torch.int64)
+        return empty, empty, empty_tokens
 
     num_vocab_blocks = triton.cdiv(vocab_size, block_n)
     partial_shape = (rows, num_vocab_blocks)
     partial_max = torch.empty(partial_shape, device=hidden.device,
                               dtype=torch.float32)
     partial_denom = torch.empty_like(partial_max)
+    partial_expected = torch.empty_like(partial_max)
+    partial_argmax_value = torch.empty_like(partial_max)
+    partial_argmax_token = torch.empty(partial_shape, device=hidden.device,
+                                       dtype=torch.int64)
     grid = (triton.cdiv(rows, block_m), num_vocab_blocks)
 
-    _softcap_lse_partial_kernel[grid](
+    _softcap_reduce_partial_kernel[grid](
         hidden,
         weight,
         partial_max,
         partial_denom,
+        partial_expected,
+        partial_argmax_value,
+        partial_argmax_token,
         rows,
         hidden_size,
         vocab_size,
@@ -149,5 +173,39 @@ def diffusion_gemma_softcap_lse(
     )
 
     row_max = partial_max.max(dim=1).values
-    denom = (partial_denom * torch.exp(partial_max - row_max[:, None])).sum(dim=1)
-    return row_max + denom.log()
+    rescale = torch.exp(partial_max - row_max[:, None])
+    denom = (partial_denom * rescale).sum(dim=1)
+    expected = (partial_expected * rescale).sum(dim=1) / denom
+    lse = row_max + denom.log()
+    entropy = lse - expected
+
+    argmax_block = partial_argmax_value.max(dim=1).indices
+    argmax_tokens = partial_argmax_token.gather(
+        1, argmax_block[:, None]
+    ).squeeze(1)
+    return lse, entropy, argmax_tokens
+
+
+def diffusion_gemma_softcap_lse(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    softcap: float,
+    temperature: float,
+    *,
+    block_m: int = _DEFAULT_BLOCK_M,
+    block_n: int = _DEFAULT_BLOCK_N,
+    block_k: int = _DEFAULT_BLOCK_K,
+    num_warps: int = _DEFAULT_NUM_WARPS,
+) -> torch.Tensor:
+    """Compute row-wise softcapped lm-head logsumexp without full logits."""
+    lse, _, _ = diffusion_gemma_softcap_lse_entropy_argmax(
+        hidden,
+        weight,
+        softcap,
+        temperature,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        num_warps=num_warps,
+    )
+    return lse
