@@ -62,6 +62,11 @@ from .interfaces import (
 
 logger = init_logger(__name__)
 
+# Vocab chunk size for streaming self-conditioning moments. This keeps the
+# temporary probability tile bounded while preserving enough work per chunk for
+# efficient matmuls.
+_DIFFUSION_GEMMA_SC_CHUNK_SIZE = 16384
+
 
 class DiffusionGemmaSelfConditioning(nn.Module):
     """Gated MLP that processes soft embeddings from the previous denoising step.
@@ -463,6 +468,36 @@ def _compute_num_rejected(
     return torch.where(is_denoise, query_lens, num_rejected)
 
 
+def _compute_softmax_moments(
+    scaled: torch.Tensor,
+    embed_weight: torch.Tensor,
+    vocab_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Avoid materializing full-vocab log_probs and probs. For scaled logits x:
+    #   H(softmax(x)) = logsumexp(x) - E_softmax(x)[x]
+    # and self-conditioning needs E_softmax(x)[embed].
+    lse = scaled.logsumexp(dim=-1)
+    expected_scaled = torch.zeros_like(lse)
+    soft_embeds = torch.zeros(
+        (*scaled.shape[:-1], embed_weight.shape[1]),
+        device=scaled.device,
+        dtype=torch.float32,
+    )
+    for start in range(0, vocab_size, _DIFFUSION_GEMMA_SC_CHUNK_SIZE):
+        end = start + _DIFFUSION_GEMMA_SC_CHUNK_SIZE
+        scaled_chunk = scaled[..., start:end]
+        probs_chunk = (scaled_chunk - lse[..., None]).exp()
+        expected_scaled.add_((probs_chunk * scaled_chunk).sum(dim=-1))
+        soft_embeds.add_(
+            torch.matmul(
+                probs_chunk.to(embed_weight.dtype), embed_weight[start:end]
+            ).float()
+        )
+
+    return lse - expected_scaled, soft_embeds
+
+
+
 @torch.compile(dynamic=True)
 def _compiled_sample_step(
     # Logits from the model [num_decode * CL, vocab]
@@ -497,12 +532,13 @@ def _compiled_sample_step(
     ST: int,
     # Sampler config
     entropy_bound: float,
+    return_scaled: bool,
 ) -> torch.Tensor:
     """Compiled decode step: temperature → Gumbel sample → probs/confidence →
     accept/renoise → convergence, all as vectorized PyTorch ops.
 
-    Returns the temperature-scaled logits ``[num_decode, CL, vocab]`` so the
-    caller can compute logprobs outside the compiled region."""
+    Returns the temperature-scaled logits ``[num_decode, CL, vocab]`` only when
+    the caller needs logprobs outside the compiled region."""
     num_decode = decode_slots.shape[0]
     device = decode_slots.device
 
@@ -517,24 +553,31 @@ def _compiled_sample_step(
     temp = t_min + (t_max - t_min) * (remaining / max_denoising_steps)
 
     # ---- Phase 2: Temperature scaling + Gumbel-max sampling ----
-    logits_3d = logits.reshape(num_decode, CL, -1).float()
-    scaled = logits_3d / temp[:, None, None].clamp(min=1e-10)
+    logits_3d = logits.reshape(num_decode, CL, -1)
+    # _softcap_logits already returns fp32 for DiffusionGemma. Reuse that
+    # sampler-owned buffer for temperature scaling instead of allocating a
+    # second full [num_decode * CL, vocab] fp32 tensor.
+    scaled = logits_3d.to(dtype=torch.float32, copy=False)
+    scaled.div_(temp[:, None, None].clamp(min=1e-10))
 
-    # Gumbel-max trick: argmax(logits/T + Gumbel) ~ sample from softmax(logits/T)
-    u = torch.rand_like(scaled).clamp(min=1e-20)
-    gumbel = -torch.log(-torch.log(u))
-    # Zero noise when temp==0 (greedy)
-    noisy = scaled + gumbel * (temp[:, None, None] > 0).float()
+    # Gumbel-max trick: if q ~ Exp(1), then -log(q) is standard Gumbel.
+    # Build noisy logits in one full-vocab buffer instead of materializing
+    # separate uniform, Gumbel, and noisy tensors.
+    noisy = torch.empty_like(scaled)
+    noisy.exponential_()
+    noisy.log_()
+    noisy.neg_()
+    noisy.mul_((temp[:, None, None] > 0).float())
+    noisy.add_(scaled)
     new_tokens = noisy.view(-1, noisy.shape[-1]).argmax(dim=-1).view(num_decode, CL)
     argmax_tokens = (
         scaled.view(-1, scaled.shape[-1]).argmax(dim=-1).view(num_decode, CL)
     )
 
     # ---- Phase 3: Probs, self-conditioning, confidence ----
-    log_probs = scaled.log_softmax(dim=-1)
-    probs = log_probs.exp()
-
-    token_entropy = -(probs * log_probs).sum(dim=-1)  # [num_decode, CL]
+    token_entropy, soft_embeds = _compute_softmax_moments(
+        scaled, embed_weight, vocab_size
+    )
     # A canvas truncated near max_model_len is zero-padded up to CL by the
     # caller; those padded rows are uniform (max entropy, argmax 0), so they
     # never trigger early convergence and are stable, and only the real
@@ -627,8 +670,9 @@ def _compiled_sample_step(
     # sc_embeds directly. Storing the [.., hidden] soft embed instead of the full
     # [.., vocab] probs avoids a giant persistent buffer.
     sc_keep = (is_denoise & ~is_encoder_phase[decode_slots])[:, None, None]
-    soft_embeds = torch.matmul(probs.to(embed_weight.dtype), embed_weight) * normalizer
-    sc_embeds[decode_slots] = soft_embeds * sc_keep
+    sc_embeds[decode_slots] = (soft_embeds * normalizer * sc_keep).to(
+        sc_embeds.dtype
+    )
 
     # Overwrite canvas with argmax for newly converged denoise requests
     newly_converged = (converged & is_denoise).unsqueeze(1)
@@ -639,7 +683,7 @@ def _compiled_sample_step(
     # ---- Phase 7: Copy canvas → draft_tokens for all slots ----
     draft_tokens[all_slots, :CL] = canvas[all_slots]
 
-    return scaled
+    return scaled if return_scaled else scaled.new_empty((0,))
 
 
 class DiffusionGemmaRequestStates:
@@ -1268,6 +1312,9 @@ class DiffusionSampler:
         # since it mutates is_encoder_phase (commit→False, converge→True).
         is_committing = states.is_encoder_phase[decode_slots].clone()
 
+        slots_np = input_batch.idx_mapping_np[:num_reqs]
+        max_num_logprobs = self.sampling_states.max_num_logprobs(slots_np)
+
         # --- Single compiled call: temp → sample → probs → post-process ---
         scaled = _compiled_sample_step(
             logits,
@@ -1299,14 +1346,13 @@ class DiffusionSampler:
             CL=self.canvas_length,
             ST=states.stability_threshold,
             entropy_bound=self.entropy_bound,
+            return_scaled=max_num_logprobs >= 0,
         )
 
         # --- Logprobs: stash on convergence, return on commit ---
-        slots_np = input_batch.idx_mapping_np[:num_reqs]
         is_decode_np = per_req_nlogits_np > 0
 
         logprobs_tensors = None
-        max_num_logprobs = self.sampling_states.max_num_logprobs(slots_np)
         if max_num_logprobs >= 0:
             # Denoise steps that just converged: the compiled step flipped
             # is_encoder_phase from False→True. Detect as slots where
