@@ -7,6 +7,7 @@ import torch
 from vllm.model_executor.models.diffusion_gemma_fused_lse import (
     diffusion_gemma_merge_softcap_shard_states,
     diffusion_gemma_softcap_lse,
+    diffusion_gemma_softcap_online_soft_embeds,
     diffusion_gemma_softcap_lse_entropy_argmax,
     diffusion_gemma_softcap_reductions_soft_embeds,
     diffusion_gemma_softcap_shard_state,
@@ -68,6 +69,19 @@ def _reference_soft_embeds(
     scaled = torch.tanh(logits.float() / softcap) * softcap / temperature
     probs = scaled.softmax(dim=-1)
     return (probs.to(embed_weight.dtype) @ embed_weight).float()
+
+
+def _reference_soft_embeds_fp32(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    embed_weight: torch.Tensor,
+    softcap: float,
+    temperature: float,
+) -> torch.Tensor:
+    logits = hidden.float() @ weight.float().t()
+    scaled = torch.tanh(logits / softcap) * softcap / temperature
+    probs = scaled.softmax(dim=-1)
+    return probs @ embed_weight.float()
 
 
 def _assert_selected_token_is_near_materialized_max(
@@ -308,6 +322,148 @@ def _shard_states(
             )
         )
     return states
+
+
+def test_diffusion_gemma_softcap_online_soft_embeds_matches_reference():
+    hidden, weight = _make_inputs(rows=23, hidden_size=128, vocab_size=1543)
+    embed_weight = _make_embed_weight(vocab_size=1543, embed_size=96,
+                                      seed=20260619)
+
+    actual = diffusion_gemma_softcap_online_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=30.0,
+        temperature=0.7,
+        soft_embed_chunk_size=256,
+    )
+    expected_lse, expected_entropy, _ = _reference_softcap_reductions(
+        hidden, weight, softcap=30.0, temperature=0.7
+    )
+    expected_soft_embeds = _reference_soft_embeds(
+        hidden, weight, embed_weight, softcap=30.0, temperature=0.7
+    )
+
+    torch.testing.assert_close(actual[0], expected_lse, rtol=3e-4, atol=2e-3)
+    torch.testing.assert_close(actual[1], expected_entropy, rtol=1e-3,
+                               atol=1e-3)
+    _assert_selected_token_is_near_materialized_max(
+        hidden, weight, actual[2], softcap=30.0, temperature=0.7
+    )
+    torch.testing.assert_close(actual[3], expected_soft_embeds, rtol=2e-2,
+                               atol=2e-2)
+
+
+def test_diffusion_gemma_softcap_online_soft_embeds_matches_peaked_fp32_reference():
+    torch.manual_seed(20260620)
+    hidden = torch.randn(13, 128, device="cuda", dtype=torch.bfloat16) * 2
+    weight = torch.randn(997, 128, device="cuda", dtype=torch.bfloat16)
+    embed_weight = _make_embed_weight(vocab_size=997, embed_size=64,
+                                      seed=20260621)
+    # Force a few high-confidence rows so this does not only cover the benign
+    # near-uniform synthetic distribution.
+    weight[:13] = hidden / hidden.float().norm(dim=-1, keepdim=True).to(
+        hidden.dtype
+    ) * 8
+
+    actual = diffusion_gemma_softcap_online_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=5.0,
+        temperature=0.3,
+        soft_embed_chunk_size=127,
+    )
+    expected_soft_embeds = _reference_soft_embeds_fp32(
+        hidden, weight, embed_weight, softcap=5.0, temperature=0.3
+    )
+
+    torch.testing.assert_close(actual[3], expected_soft_embeds, rtol=5e-2,
+                               atol=5e-2)
+
+
+def test_diffusion_gemma_softcap_online_soft_embeds_chunk_size_invariant():
+    hidden, weight = _make_inputs(rows=11, hidden_size=96, vocab_size=677)
+    embed_weight = _make_embed_weight(vocab_size=677, embed_size=48,
+                                      seed=20260622)
+    expected = diffusion_gemma_softcap_online_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=30.0,
+        temperature=0.7,
+        soft_embed_chunk_size=677,
+    )
+
+    for chunk_size in (1, 113, 256):
+        actual = diffusion_gemma_softcap_online_soft_embeds(
+            hidden,
+            weight,
+            embed_weight,
+            softcap=30.0,
+            temperature=0.7,
+            soft_embed_chunk_size=chunk_size,
+        )
+        torch.testing.assert_close(actual[0], expected[0], rtol=3e-4,
+                                   atol=2e-3)
+        torch.testing.assert_close(actual[1], expected[1], rtol=1e-3,
+                                   atol=1e-3)
+        torch.testing.assert_close(actual[2], expected[2], rtol=0, atol=0)
+        torch.testing.assert_close(actual[3], expected[3], rtol=2e-2,
+                                   atol=2e-2)
+
+
+def test_diffusion_gemma_softcap_online_matches_triton_reductions():
+    hidden, weight = _make_inputs(rows=17, hidden_size=128, vocab_size=1031)
+    embed_weight = _make_embed_weight(vocab_size=1031, embed_size=32,
+                                      seed=20260623)
+
+    online = diffusion_gemma_softcap_online_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=30.0,
+        temperature=0.7,
+        soft_embed_chunk_size=257,
+    )
+    triton_lse, triton_entropy, triton_argmax = (
+        diffusion_gemma_softcap_lse_entropy_argmax(
+            hidden,
+            weight,
+            softcap=30.0,
+            temperature=0.7,
+            block_m=16,
+            block_n=128,
+            block_k=64,
+            num_warps=4,
+        )
+    )
+
+    torch.testing.assert_close(online[0], triton_lse, rtol=3e-4, atol=2e-3)
+    torch.testing.assert_close(online[1], triton_entropy, rtol=1e-3,
+                               atol=1e-3)
+    _assert_selected_token_is_near_materialized_max(
+        hidden, weight, triton_argmax, softcap=30.0, temperature=0.7
+    )
+    _assert_selected_token_is_near_materialized_max(
+        hidden, weight, online[2], softcap=30.0, temperature=0.7
+    )
+
+
+def test_diffusion_gemma_softcap_online_soft_embeds_handles_empty_rows():
+    hidden = torch.empty((0, 64), device="cuda", dtype=torch.bfloat16)
+    weight = torch.empty((257, 64), device="cuda", dtype=torch.bfloat16)
+    embed_weight = torch.empty((257, 48), device="cuda", dtype=torch.bfloat16)
+
+    lse, entropy, argmax, soft_embeds = diffusion_gemma_softcap_online_soft_embeds(
+        hidden, weight, embed_weight, softcap=30.0, temperature=0.7
+    )
+
+    assert lse.shape == (0,)
+    assert entropy.shape == (0,)
+    assert argmax.shape == (0,)
+    assert soft_embeds.shape == (0, 48)
+    assert soft_embeds.dtype == torch.float32
 
 
 def test_diffusion_gemma_tp_shard_merge_matches_materialized_reference():

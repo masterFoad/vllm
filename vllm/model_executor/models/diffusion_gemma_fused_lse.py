@@ -19,7 +19,7 @@ import triton.language as tl
 _DEFAULT_BLOCK_M = 32
 _DEFAULT_BLOCK_N = 128
 _DEFAULT_BLOCK_K = 64
-_DEFAULT_SOFT_EMBED_CHUNK = 8192
+_DEFAULT_SOFT_EMBED_CHUNK = 32768
 _DEFAULT_NUM_WARPS = 8
 
 
@@ -337,13 +337,47 @@ def diffusion_gemma_softcap_shard_state(
         )
         running_max = new_max
 
-        tile_argmax_value, tile_argmax_local = scaled.max(dim=-1)
+        tile_argmax_value = tile_max
+        tile_argmax_local = scaled.argmax(dim=-1)
         tile_argmax_token = tile_argmax_local.to(torch.int64) + vocab_start + start
         update_argmax = tile_argmax_value > argmax_value
         argmax_value = torch.where(update_argmax, tile_argmax_value, argmax_value)
         argmax_token = torch.where(update_argmax, tile_argmax_token, argmax_token)
 
     return running_max, denom, expected, soft_embed, argmax_value, argmax_token
+
+
+def diffusion_gemma_softcap_online_soft_embeds(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    embed_weight: torch.Tensor,
+    softcap: float,
+    temperature: float,
+    *,
+    soft_embed_chunk_size: int = _DEFAULT_SOFT_EMBED_CHUNK,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute reductions and soft embeddings with one online vocab pass.
+
+    This is the single-rank form of the vocab-shard state contract. It streams
+    vocab chunks once, keeps online softmax state in fp32, and normalizes only
+    after all chunks are merged.
+    """
+    row_max, denom, expected, soft_embed, _, argmax_token = (
+        diffusion_gemma_softcap_shard_state(
+            hidden,
+            weight,
+            embed_weight,
+            softcap,
+            temperature,
+            vocab_start=0,
+            soft_embed_chunk_size=soft_embed_chunk_size,
+        )
+    )
+    if hidden.shape[0] == 0:
+        return row_max, denom, argmax_token, soft_embed
+    lse = row_max + denom.log()
+    entropy = lse - expected / denom
+    return lse, entropy, argmax_token, soft_embed / denom[:, None]
 
 
 def diffusion_gemma_merge_softcap_shard_states(
