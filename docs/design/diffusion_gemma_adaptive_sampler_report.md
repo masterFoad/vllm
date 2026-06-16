@@ -109,7 +109,12 @@ VLLM_DIFFUSION_GEMMA_STREAMED_BACKEND=auto
 
 Without `VLLM_DIFFUSION_GEMMA_STREAMED_SAMPLER=1`, the backend selector is not
 used. With the streamed sampler enabled but no backend override, the selector
-uses `eager`, not `auto`.
+uses `eager`, not `auto`. The current `auto` policy is a static
+`sampler_rows` threshold; it does not query allocator headroom or predict OOM
+dynamically. The `2048` threshold and `128` fallback chunk were selected for the
+tested A100/OpenShift shape and should be retuned before treating them as
+universal defaults; code comments and PR text should keep that hardware-specific
+warning visible.
 
 ## Paths we tried and rejected
 
@@ -166,12 +171,12 @@ VLLM_DIFFUSION_GEMMA_STREAMED_ROW_CHUNK=128
 --max-num-seqs 16
 ```
 
-Baseline pressure probe with the same high-pressure serving shape:
+Preliminary pressure probe with the same high-pressure serving shape, before selecting the final `row_chunk=128` fallback:
 
 | variant | c8 | c12 | c16 | max sampler rows | result |
 |---|---:|---:|---:|---:|---|
-| baseline | 102.6 tok/s, 0 errors | OOM / 24 errors | OOM / 32 errors | 3072 | fails under pressure |
-| rowchunk_256 | 110.7 tok/s, 0 errors | 238.7 tok/s, 0 errors | 216.1 tok/s, 0 errors | 3072 | survives |
+| baseline | 102.6 tok/s, 0 errors | OOM / 24 errors | OOM / 32 errors | 3072 observed | fails under pressure |
+| rowchunk_256 | 110.7 tok/s, 0 errors | 238.7 tok/s, 0 errors | 216.1 tok/s, 0 errors | 3072 observed | survives |
 
 After selecting row chunk 128 for the `auto` fallback:
 
@@ -224,6 +229,10 @@ Observed result:
 Fresh targeted rerun of the most relevant tests:
 
 ```text
+test_diffusion_gemma_streamed_backend_validation
+test_diffusion_gemma_streamed_auto_backend_boundary
+test_diffusion_gemma_row_chunked_sample_soft_embeds_matches_cublas
+
 3 passed, 20 warnings in 15.99s
 ```
 
@@ -263,7 +272,7 @@ Then compare c8/c12/c16 client concurrency.
 
 ## Artifact map
 
-Primary final report artifact outside this worktree:
+Primary final report artifact outside this worktree. These `.omx` paths are local/private workspace evidence, not upstream vLLM documentation assets:
 
 ```text
 .omx/artifacts/diffusion-gemma-sampler-evolve/20260616T-auto-backend-final/RESULT.md
@@ -285,6 +294,445 @@ File-council review artifacts:
 .omx/artifacts/diffusion-gemma-sampler-evolve/20260616T-file-council-after-auto-backend-compact/
 .omx/artifacts/diffusion-gemma-sampler-evolve/20260616T-file-council-auto-chunk128/
 .omx/artifacts/diffusion-gemma-sampler-evolve/20260616T-file-council-after-auto128-final/
+```
+
+## Handoff: how to continue from this branch
+
+This section is meant for a future session starting cold. The current branch is
+not a PR branch yet; treat it as the local baseline for continued DiffusionGemma
+capacity work.
+
+### Branch and file map
+
+Branch name used when written:
+
+```text
+branch: masterfoad/diffusion-gemma-adaptive-sampler-baseline-20260616
+fork remote used when written: git@github.com:masterFoad/vllm.git
+upstream base when written: vLLM origin/main 8e27a9c21
+```
+
+Main files to read first:
+
+```text
+docs/design/diffusion_gemma_adaptive_sampler_report.md
+vllm/model_executor/models/diffusion_gemma.py
+vllm/model_executor/models/diffusion_gemma_fused_lse.py
+tests/model_executor/test_diffusion_gemma_fused_lse.py
+```
+
+Start by checking whether the branch is still based on current upstream.
+Remote names can differ by checkout; use whichever remote points at
+`vllm-project/vllm`:
+
+```bash
+git remote -v
+# If needed:
+git remote add upstream https://github.com/vllm-project/vllm.git || true
+git fetch upstream main
+git status --short --branch
+git log --oneline upstream/main..HEAD
+```
+
+If continuing experiments rather than preparing a PR, keep changes local or push
+to the `masterFoad/vllm` fork. Do not open a PR until the broader validation and
+vLLM contribution checks are done.
+
+### Skills and review surfaces used
+
+We used three local reasoning/review surfaces. They are part of the process
+history, not runtime dependencies. The paths below are local/private workflow
+conventions from this workstation; sanitize or remove them before any upstream
+PR-facing documentation.
+
+#### File Council
+
+Local skill source: Codex skill registry / file-council skill. The exact local path is machine-specific and not a vLLM dependency.
+
+What it does: sends selected local files plus one prompt to ChatGPT, Claude,
+Gemini Pro, and Gemini Flash through the configured IBM LiteLLM REST gateway. It
+writes durable JSONL/raw artifacts, but it does not synthesize or arbitrate by
+itself.
+
+When we used it:
+
+- before/after significant design changes;
+- after the adaptive backend/report was written;
+- after the report-review pass caught a real documentation bug: the report
+  initially forgot that `VLLM_DIFFUSION_GEMMA_STREAMED_SAMPLER=1` is required
+  before `VLLM_DIFFUSION_GEMMA_STREAMED_BACKEND=auto` has any effect.
+
+Reusable command shape:
+
+```bash
+python "$FILE_COUNCIL_SKILL_DIR/scripts/run_file_council.py" \
+  --session "dg-adaptive-review-$(date -u +%Y%m%dT%H%M%SZ)" \
+  --state-dir .omx/file-council \
+  --prompt "Review these files for overclaims, correctness risks, and missing caveats." \
+  --file /absolute/path/to/docs/design/diffusion_gemma_adaptive_sampler_report.md \
+  --file /absolute/path/to/vllm/model_executor/models/diffusion_gemma.py \
+  --file /absolute/path/to/vllm/model_executor/models/diffusion_gemma_fused_lse.py \
+  --file /absolute/path/to/tests/model_executor/test_diffusion_gemma_fused_lse.py \
+  --targets chatgpt claude gemini gemini-flash \
+  --thinking medium \
+  --no-web-search
+```
+
+Most useful local/private file-council artifacts from this investigation:
+
+```text
+.omx/artifacts/diffusion-gemma-sampler-evolve/20260616T-file-council-before-auto-backend-compact/
+.omx/artifacts/diffusion-gemma-sampler-evolve/20260616T-file-council-after-auto-backend-compact/
+.omx/artifacts/diffusion-gemma-sampler-evolve/20260616T-file-council-auto-chunk128/
+.omx/artifacts/diffusion-gemma-sampler-evolve/20260616T-file-council-after-auto128-final/
+.omx/artifacts/diffusion-gemma-sampler-evolve/20260616T-report-commit-review*/
+```
+
+#### Draw5 Operator Cards
+
+Local skill source: Draw5 Operator Cards skill. The exact local path is machine-specific and not a vLLM dependency.
+
+What it did for this work: forced the optimization search into an operator
+ladder instead of chasing one shiny kernel. The useful operators were:
+
+- proxy metric -> true objective alignment: do not trust scratch-only wins;
+  require serving tok/s, latency, errors/OOM, and exactness;
+- flat retrieved hand -> typed operator ladder: separate primitives, process,
+  risk, and validation operators;
+- GPU kernel/SIMD/fusion analogies: useful for fused-kernel hypotheses, but only
+  after exactness and serving gates.
+
+Commands used/usable:
+
+```bash
+SKILL_DIR="$DRAW5_SKILL_DIR"
+python "$SKILL_DIR/scripts/operator_retriever.py" build \
+  --cards "$SKILL_DIR/cards" \
+  --index .draw5_operator_index \
+  --provider hashing \
+  --backend numpy
+
+python "$SKILL_DIR/scripts/operator_retriever.py" query \
+  --index .draw5_operator_index \
+  --query "DiffusionGemma sampler memory OOM survival GPU kernel row chunking adaptive fallback soft embedding exactness benchmark strategy" \
+  --mode deck-of-decks \
+  --top 10 \
+  --format prompt
+```
+
+Latest local/private query artifact:
+
+```text
+.omx/artifacts/diffusion-gemma-sampler-evolve/20260616T-report-handoff-skills/draw5-query.md
+```
+
+#### Concept Blending
+
+Local skill source: Concept Blending skill. The exact local path is machine-specific and not a vLLM dependency.
+
+What it did for this work: generated falsifiable candidate mechanisms and then
+clamped them against prior art, mechanism, constraints, and strongest objection.
+The strongest surviving concepts were:
+
+1. **Exact Row-Chunk Autotune** — choose row-chunking by a Pareto frontier and
+   use it only as a fallback. This is the idea that became the practical
+   `auto` backend baseline.
+2. **Flash-GEMM SoftEmbed** — future fused/tiled kernel direction, but only if it
+   keeps exactness and throughput after a hard isolated gate.
+3. **Liger/CCE Borrowed Skeleton** — use fused linear cross-entropy / Liger-style
+   tiling as inspiration, not as a new dependency.
+
+Primary local plan artifact:
+
+```text
+.omx/artifacts/diffusion-gemma-sampler-evolve/DRAW5_CONCEPT_BLEND_SOFTEMBED_PLAN.md
+```
+
+### OpenShift operating recipe
+
+Use OpenShift for all GPU claims. Do not claim GPU correctness/performance from
+WSL-only pytest or CPU checks.
+
+Project and model:
+
+```text
+OpenShift project: wdu-research
+Model: google/diffusiongemma-26B-A4B-it
+Working image: vllm/vllm-openai:gemma
+PVC: model-cache-rwx mounted at /model-cache
+HF cache: /model-cache/huggingface
+```
+
+Login should use a fresh token from the user/environment; do not write tokens
+into repo artifacts:
+
+```bash
+oc login --token=<fresh-token> --server=<openshift-api-server>
+oc project wdu-research
+```
+
+Before creating anything, check whether a server pod already exists:
+
+```bash
+oc get appwrappers,jobs,pods -l app=diffusiongemma-chat -o wide
+```
+
+If reusing a pod, first verify that its image/command/env match the experiment;
+an old running pod may be from a different branch or backend:
+
+```bash
+oc describe pod/$POD | grep -E 'Image:|VLLM_DIFFUSION_GEMMA|max-num-batched|max-num-seqs' || true
+oc logs pod/$POD | grep -E 'VLLM_DIFFUSION_GEMMA|effective_backend|sampler_rows|row_chunk' | tail -50 || true
+```
+
+If a Running pod exists, reuse it and port-forward rather than creating another
+job:
+
+```bash
+POD=$(oc get pods -l app=diffusiongemma-chat \
+  -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' \
+  | head -n 1)
+if [ -z "$POD" ]; then echo "No running pod found; create/reuse a job first"; exit 1; fi
+oc port-forward pod/$POD 8000:8000
+```
+
+Smoke checks:
+
+```bash
+curl -fsS http://127.0.0.1:8000/v1/models | jq .
+
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "google/diffusiongemma-26B-A4B-it",
+    "messages": [{"role": "user", "content": "Write two sentences about diffusion language models."}],
+    "max_tokens": 128,
+    "temperature": 0.7
+  }' | jq .
+```
+
+Known local helpers from the parent repo:
+
+```bash
+scripts/start_diffusiongemma_port_forward.sh --status
+JOB=<new-job-name> scripts/start_diffusiongemma_port_forward.sh
+python3 scripts/diffusiongemma_chat_ui.py --open
+python3 scripts/diffusiongemma_canvas_ui.py --open
+```
+
+The `vllm serve` command below is the container entrypoint shape for the
+OpenShift AppWrapper/Job, not a command to run on the WSL host. If no compatible
+pod exists, create a new AppWrapper/Job and inject the adaptive sampler env vars
+into the container environment before `vllm serve`. Known-good parent-repo
+templates to inspect before recreating the job:
+
+```text
+.omx/artifacts/diffusiongemma-openshift/tavily-20260611t145959/appwrapper.yaml
+.omx/artifacts/diffusiongemma-openshift/20260611T103748Z/run_diffusiongemma_server.sh
+.omx/artifacts/diffusiongemma-openshift/20260611T103748Z/README-talk-to-diffusiongemma.md
+```
+
+Serving command baseline inside the pod/job:
+
+```bash
+vllm serve google/diffusiongemma-26B-A4B-it \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --dtype bfloat16 \
+  --gpu-memory-utilization 0.90 \
+  --max-model-len 8192 \
+  --trust-remote-code
+```
+
+For adaptive sampler experiments, add:
+
+```bash
+export VLLM_DIFFUSION_GEMMA_STREAMED_SAMPLER=1
+export VLLM_DIFFUSION_GEMMA_STREAMED_BACKEND=auto
+export VLLM_DIFFUSION_GEMMA_STREAMED_AUTO_MAX_MATERIALIZED_ROWS=2048
+export VLLM_DIFFUSION_GEMMA_STREAMED_ROW_CHUNK=128
+# Optional diagnostics:
+export VLLM_DIFFUSION_GEMMA_LOG_DECODE_BATCH=1
+```
+
+Pressure discriminator used for the strongest result:
+
+```text
+--max-num-batched-tokens 4096
+--max-num-seqs 16
+client concurrency sweep: c8, c12, c16
+```
+
+Benchmark harness notes:
+
+```text
+c8:  concurrency=8,  total requests=16
+c12: concurrency=12, total requests=24
+c16: concurrency=16, total requests=32
+max_tokens: 128 in the pressure runs
+metrics: successful completion tokens / wall seconds, request errors, p50 when captured, and coarse GPU memory polling
+```
+
+The final pressure run artifacts are the source of truth for exact fields:
+
+```text
+.omx/artifacts/diffusion-gemma-sampler-evolve/auto-pressure128-20260616T175855Z/auto_pressure128/bench_c12.json
+.omx/artifacts/diffusion-gemma-sampler-evolve/auto-pressure128-20260616T175855Z/auto_pressure128/bench_c16.json
+.omx/artifacts/diffusion-gemma-sampler-evolve/auto-pressure128-20260616T175855Z/auto_pressure128/server.log
+.omx/artifacts/diffusion-gemma-sampler-evolve/auto-pressure128-20260616T175855Z/auto_pressure128/key.log
+```
+
+For a future rerun, save the server log, client JSON, pod description, and GPU
+memory poll for every variant. For OOM cases, preserve the CUDA OOM traceback or
+pod termination reason. With `VLLM_DIFFUSION_GEMMA_LOG_DECODE_BATCH=1`, verify
+that logs include `effective_backend=row_chunked`, `sampler_rows`, and
+`row_chunk=128` once the threshold is crossed.
+
+### Testing strategy used
+
+The testing pyramid that worked best:
+
+1. **Static/local sanity**
+   - `py_compile` changed Python files;
+   - `git diff --check` for whitespace/conflict artifacts;
+   - these are preflight checks only, not GPU sampler validation.
+2. **OpenShift GPU unit/correctness**
+   - run `tests/model_executor/test_diffusion_gemma_fused_lse.py` in the GPU
+     image/overlay;
+   - require row-chunked equivalence against the materialized reference within
+     the tolerances documented in the tests; "exact" means same algorithmic
+     reference path/distribution, not bitwise identity unless the test explicitly
+     says so;
+   - keep the Triton exactness drift as an intentional xfail, not a hidden pass.
+3. **Serving smoke**
+   - `/v1/models` and a small `/v1/chat/completions` call;
+   - keep client fanout low for normal smoke because the server has died under
+     excessive fanout.
+4. **Normal-path throughput**
+   - c=3 repeated rounds to catch regressions when memory pressure is not the
+     binding constraint;
+   - this is where always-on row-chunking failed the no-regression bar.
+5. **High-pressure OOM/capacity discriminator**
+   - raise `max_num_batched_tokens` / `max_num_seqs` and compare c8/c12/c16;
+   - success criterion is not speedup; it is baseline OOM vs adaptive zero
+     errors at the same shape.
+6. **Review gates**
+   - file-council before/after significant pivots;
+   - explicitly separate evidence from inference and document non-claims.
+
+Useful commands after code edits:
+
+```bash
+.venv/bin/python -m py_compile \
+  vllm/model_executor/models/diffusion_gemma.py \
+  vllm/model_executor/models/diffusion_gemma_fused_lse.py \
+  tests/model_executor/test_diffusion_gemma_fused_lse.py
+
+git diff --check -- \
+  vllm/model_executor/models/diffusion_gemma.py \
+  vllm/model_executor/models/diffusion_gemma_fused_lse.py \
+  tests/model_executor/test_diffusion_gemma_fused_lse.py \
+  docs/design/diffusion_gemma_adaptive_sampler_report.md
+```
+
+Useful OpenShift pytest shape:
+
+```bash
+PYTHONPATH=/tmp/vllm-overlay pytest -q \
+  /tmp/vllm-overlay/tests/model_executor/test_diffusion_gemma_fused_lse.py
+```
+
+### Failed experiments and lessons
+
+1. **Commit-row skipping**
+   - Finding: commit rows do waste sampler work.
+   - Why it was not the main win: commit rows are rare and skipping them inside a
+     compiled whole-batch region does not remove the main full-vocab memory peak
+     without dynamic partitioning.
+   - Lesson: optimize the denoise path that every row pays, not the rare commit
+     path.
+
+2. **Sampler transient reduction / chunked softmax moments**
+   - Finding: it correctly reduced redundant sampler scratch and exposed the
+     right math: entropy from `logsumexp - E[x]`, and soft embedding as
+     `E_p[embedding]`.
+   - Bugs found/fixed: bf16 cross-chunk accumulation was lossy; fp32 multiply was
+     too slow under vLLM's TF32-disabled serving runtime. The right compromise was
+     bf16 tensor-core multiply with fp32 cross-chunk accumulation.
+   - Lesson: microbench speed can lie if runtime matmul precision differs from
+     serving.
+
+3. **KV-cache headroom claim**
+   - Finding: startup KV cache did not move meaningfully between baseline and
+     patched runs.
+   - Lesson: sampler scratch lived in runtime slack; do not claim larger startup
+     KV allocation.
+
+4. **Always-on row-chunking**
+   - Finding: it survived pressure but was slower in normal c=3 serving.
+   - Lesson: row-chunking is an OOM fallback, not a default speed path.
+
+5. **Rowchunk 384/512**
+   - Finding: larger chunks looked attractive for throughput in some normal runs,
+     but failed the high-pressure discriminator.
+   - Lesson: select fallback chunk by survival margin first; `128` is the current
+     verified safe default for `auto`.
+
+6. **Triton fused full/single-pass prototypes**
+   - Finding: tiny scratch and promising isolated pieces, but not serving-ready:
+     slow live serving and exactness drift in hard large-vocab/low-temperature
+     cases.
+   - Lesson: keep `triton_full` gated as experimental. Future fused kernels need
+     exactness parity and serving throughput gates before integration.
+
+7. **Low-fanout throughput-only tests**
+   - Finding: they can show regressions but cannot prove capacity value.
+   - Lesson: combine low-pressure throughput with high-pressure OOM survival;
+     neither alone is sufficient.
+
+### Where to go next
+
+Recommended next work, in order:
+
+1. **Longer soak of the current adaptive baseline**
+   - same high-pressure shape;
+   - more prompts and longer wall time;
+   - confirm zero errors and stable memory near c12/c16.
+2. **Broader shape sweep**
+   - `gpu_memory_utilization` variants;
+   - `max_num_batched_tokens` variants;
+   - `max_num_seqs` variants;
+   - possibly smaller GPUs if available.
+3. **CI-runnable unit cleanup**
+   - make sure exact helper tests can run in upstream vLLM CI without the custom
+     OpenShift overlay when possible.
+4. **Future fused kernel only behind a hard gate**
+   - do not revive the current Triton prototype as serving code;
+   - de-risk a production kernel in isolation first;
+   - require exactness in low-temp/large-vocab cases, throughput parity, and a
+     demonstrated capacity benefit before wiring it into serving.
+5. **Separate logprobs work**
+   - keep the known logprobs-on bug/failure class separate from this memory PR
+     line unless the user explicitly asks to merge the efforts.
+
+Before any upstream PR, add a PR-readiness checklist pass:
+
+- rebase on current upstream vLLM;
+- run the relevant vLLM lint/test subset in an upstream-compatible environment;
+- confirm env-var naming and feature gating are acceptable;
+- remove or move private OpenShift/tooling handoff details out of PR-facing docs;
+- search open vLLM PRs/issues for duplicate DiffusionGemma sampler memory work;
+- write the PR as an opt-in OOM mitigation with test evidence and AI-assistance
+  disclosure, not as a general speedup.
+
+Best one-line continuation prompt for a new session:
+
+```text
+Read docs/design/diffusion_gemma_adaptive_sampler_report.md on branch
+masterfoad/diffusion-gemma-adaptive-sampler-baseline-20260616 and continue
+OpenShift validation of the opt-in DiffusionGemma adaptive sampler baseline using
+STREAMED_SAMPLER=1, BACKEND=auto, ROW_CHUNK=128, and the
+max-num-batched-tokens=4096/max-num-seqs=16 pressure shape.
 ```
 
 ## Bottom line
