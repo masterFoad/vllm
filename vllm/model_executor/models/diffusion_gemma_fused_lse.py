@@ -19,8 +19,18 @@ import triton.language as tl
 _DEFAULT_BLOCK_M = 32
 _DEFAULT_BLOCK_N = 128
 _DEFAULT_BLOCK_K = 64
+# Memory/speed knob for the online soft-embedding path. On A100 with
+# rows=2048, vocab=262144: 4096 keeps peak scratch near 180 MiB but is slower;
+# 32768 keeps peak near 1.2 GiB and was fastest in the prototype sweep. Keep
+# this explicit until serving chooses a memory-first or throughput-first policy.
 _DEFAULT_SOFT_EMBED_CHUNK = 32768
 _DEFAULT_NUM_WARPS = 8
+_GUMBEL_CHUNK = 32768
+_INT64_MIX_A = -7046029254386353131
+_INT64_MIX_B = -4658895280553007687
+_INT64_MIX_C = -7723592293110705685
+_INT64_MASK_53 = (1 << 53) - 1
+_FLOAT_2_NEG_53 = 1.0 / float(1 << 53)
 
 
 @triton.jit
@@ -124,8 +134,8 @@ def diffusion_gemma_softcap_lse_entropy_argmax(
         raise ValueError("hidden and weight hidden dimensions must match")
     if not hidden.is_cuda or not weight.is_cuda:
         raise ValueError("hidden and weight must be CUDA tensors")
-    if temperature <= 0:
-        raise ValueError("temperature must be positive")
+    if temperature < 0:
+        raise ValueError("temperature must be non-negative")
     if softcap <= 0:
         raise ValueError("softcap must be positive")
 
@@ -282,8 +292,8 @@ def diffusion_gemma_softcap_shard_state(
         raise ValueError("embed_weight_shard must be bfloat16 for this prototype")
     if weight_shard.shape[0] == 0:
         raise ValueError("weight_shard must have at least one vocab row")
-    if temperature <= 0:
-        raise ValueError("temperature must be positive")
+    if temperature < 0:
+        raise ValueError("temperature must be non-negative")
     if softcap <= 0:
         raise ValueError("softcap must be positive")
     if soft_embed_chunk_size <= 0:
@@ -378,6 +388,261 @@ def diffusion_gemma_softcap_online_soft_embeds(
     lse = row_max + denom.log()
     entropy = lse - expected / denom
     return lse, entropy, argmax_token, soft_embed / denom[:, None]
+
+
+def _stable_uniform_from_indices(
+    row_offsets: torch.Tensor,
+    token_offsets: torch.Tensor,
+    seed: int,
+) -> torch.Tensor:
+    """Generate deterministic U(0, 1) values keyed by row and token id.
+
+    This is a prototype stateless RNG for chunked Gumbel-max. Each random value
+    depends only on ``(row, token, seed)``, so changing chunk size or vocab-shard
+    boundaries does not change the sampled token. A serving implementation
+    should replace this with vLLM's Philox/counter RNG contract.
+    """
+    x = (
+        token_offsets[None, :].to(torch.int64)
+        + (row_offsets[:, None].to(torch.int64) + 1) * _INT64_MIX_A
+        + int(seed)
+    )
+    x = (x ^ (x >> 30)) * _INT64_MIX_B
+    x = (x ^ (x >> 27)) * _INT64_MIX_C
+    x = x ^ (x >> 31)
+    mantissa = torch.bitwise_and(x, _INT64_MASK_53).to(torch.float64)
+    return ((mantissa + 0.5) * _FLOAT_2_NEG_53).to(torch.float32)
+
+
+def diffusion_gemma_softcap_gumbel_shard_state(
+    hidden: torch.Tensor,
+    weight_shard: torch.Tensor,
+    softcap: float,
+    temperature: float,
+    seed: int,
+    *,
+    vocab_start: int = 0,
+    chunk_size: int = _GUMBEL_CHUNK,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample one vocab shard with token-index-stable Gumbel-max state."""
+    if hidden.ndim != 2 or weight_shard.ndim != 2:
+        raise ValueError("hidden and weight_shard must be rank-2 tensors")
+    if hidden.shape[1] != weight_shard.shape[1]:
+        raise ValueError("hidden and weight_shard hidden dimensions must match")
+    if not hidden.is_cuda or not weight_shard.is_cuda:
+        raise ValueError("hidden and weight_shard must be CUDA tensors")
+    if weight_shard.shape[0] == 0:
+        raise ValueError("weight_shard must have at least one vocab row")
+    if temperature < 0:
+        raise ValueError("temperature must be non-negative")
+    if softcap <= 0:
+        raise ValueError("softcap must be positive")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+
+    hidden = hidden.contiguous()
+    weight_shard = weight_shard.contiguous()
+    rows = hidden.shape[0]
+    shard_vocab = weight_shard.shape[0]
+    device = hidden.device
+    if rows == 0:
+        empty_values = torch.empty((0,), device=device, dtype=torch.float32)
+        empty_tokens = torch.empty((0,), device=device, dtype=torch.int64)
+        return empty_values, empty_tokens
+
+    row_offsets = torch.arange(rows, device=device, dtype=torch.int64)
+    best_value = torch.full((rows,), -torch.inf, device=device,
+                            dtype=torch.float32)
+    best_token = torch.zeros((rows,), device=device, dtype=torch.int64)
+
+    for start in range(0, shard_vocab, chunk_size):
+        end = min(start + chunk_size, shard_vocab)
+        token_offsets = torch.arange(
+            vocab_start + start, vocab_start + end, device=device,
+            dtype=torch.int64
+        )
+        logits = hidden @ weight_shard[start:end].t()
+        scaled = (
+            torch.tanh(logits.float() / softcap)
+            * softcap
+            / max(float(temperature), 1e-10)
+        )
+        if temperature > 0:
+            uniform = _stable_uniform_from_indices(row_offsets, token_offsets,
+                                                   seed)
+            gumbel = -torch.log(-torch.log(uniform))
+            noisy = scaled + gumbel
+        else:
+            noisy = scaled
+        tile_value, tile_local = noisy.max(dim=-1)
+        tile_token = tile_local.to(torch.int64) + vocab_start + start
+        update = tile_value > best_value
+        best_value = torch.where(update, tile_value, best_value)
+        best_token = torch.where(update, tile_token, best_token)
+
+    return best_value, best_token
+
+
+def diffusion_gemma_merge_gumbel_shard_states(
+    shard_states: list[tuple[torch.Tensor, torch.Tensor]],
+) -> torch.Tensor:
+    """Merge per-shard Gumbel-max states with lowest-token tie breaking."""
+    if not shard_states:
+        raise ValueError("at least one shard state is required")
+
+    shard_values = torch.stack([state[0] for state in shard_states])
+    shard_tokens = torch.stack([state[1] for state in shard_states])
+    best_value = shard_values.max(dim=0).values
+    max_int = torch.iinfo(shard_tokens.dtype).max
+    candidate_tokens = torch.where(
+        shard_values == best_value[None, :],
+        shard_tokens,
+        torch.full_like(shard_tokens, max_int),
+    )
+    return candidate_tokens.min(dim=0).values
+
+
+def diffusion_gemma_softcap_gumbel_sample(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    softcap: float,
+    temperature: float,
+    seed: int,
+    *,
+    chunk_size: int = _GUMBEL_CHUNK,
+) -> torch.Tensor:
+    """Sample from softmax(softcapped logits / temperature) without full noise."""
+    state = diffusion_gemma_softcap_gumbel_shard_state(
+        hidden,
+        weight,
+        softcap,
+        temperature,
+        seed,
+        vocab_start=0,
+        chunk_size=chunk_size,
+    )
+    return diffusion_gemma_merge_gumbel_shard_states([state])
+
+
+def diffusion_gemma_softcap_online_sample_soft_embeds(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    embed_weight: torch.Tensor,
+    softcap: float,
+    temperature: float,
+    seed: int,
+    *,
+    soft_embed_chunk_size: int = _DEFAULT_SOFT_EMBED_CHUNK,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+           torch.Tensor]:
+    """Compute sampler-shaped outputs in one token-index-stable vocab pass.
+
+    Returns ``(lse, entropy, sampled_token, greedy_token, soft_embed)``. This is
+    the single-rank prototype shape the serving sampler needs: sampled tokens
+    for denoising, greedy tokens for convergence/history, entropy for
+    acceptance, and soft embeddings for self-conditioning.
+    """
+    if hidden.ndim != 2 or weight.ndim != 2 or embed_weight.ndim != 2:
+        raise ValueError("hidden, weight, and embed_weight must be rank-2")
+    if hidden.shape[1] != weight.shape[1]:
+        raise ValueError("hidden and weight hidden dimensions must match")
+    if weight.shape[0] != embed_weight.shape[0]:
+        raise ValueError("vocab dimensions must match")
+    if not hidden.is_cuda or not weight.is_cuda or not embed_weight.is_cuda:
+        raise ValueError("all inputs must be CUDA tensors")
+    if embed_weight.dtype != torch.bfloat16:
+        raise ValueError("embed_weight must be bfloat16 for this prototype")
+    if temperature < 0:
+        raise ValueError("temperature must be non-negative")
+    if softcap <= 0:
+        raise ValueError("softcap must be positive")
+    if soft_embed_chunk_size <= 0:
+        raise ValueError("soft_embed_chunk_size must be positive")
+
+    hidden = hidden.contiguous()
+    weight = weight.contiguous()
+    embed_weight = embed_weight.contiguous()
+    rows = hidden.shape[0]
+    vocab = weight.shape[0]
+    embed_size = embed_weight.shape[1]
+    device = hidden.device
+    if rows == 0:
+        empty = torch.empty((0,), device=device, dtype=torch.float32)
+        empty_tokens = torch.empty((0,), device=device, dtype=torch.int64)
+        empty_soft = torch.empty((0, embed_size), device=device,
+                                 dtype=torch.float32)
+        return empty, empty, empty_tokens, empty_tokens, empty_soft
+
+    row_offsets = torch.arange(rows, device=device, dtype=torch.int64)
+    running_max = torch.full((rows,), -torch.inf, device=device,
+                             dtype=torch.float32)
+    denom = torch.zeros((rows,), device=device, dtype=torch.float32)
+    expected = torch.zeros((rows,), device=device, dtype=torch.float32)
+    soft_embed = torch.zeros((rows, embed_size), device=device,
+                             dtype=torch.float32)
+    greedy_value = torch.full((rows,), -torch.inf, device=device,
+                              dtype=torch.float32)
+    greedy_token = torch.zeros((rows,), device=device, dtype=torch.int64)
+    sample_value = torch.full((rows,), -torch.inf, device=device,
+                              dtype=torch.float32)
+    sample_token = torch.zeros((rows,), device=device, dtype=torch.int64)
+
+    for start in range(0, vocab, soft_embed_chunk_size):
+        end = min(start + soft_embed_chunk_size, vocab)
+        token_offsets = torch.arange(start, end, device=device,
+                                     dtype=torch.int64)
+        logits = hidden @ weight[start:end].t()
+        scaled = (
+            torch.tanh(logits.float() / softcap)
+            * softcap
+            / max(float(temperature), 1e-10)
+        )
+
+        tile_max = scaled.max(dim=-1).values
+        weights = torch.exp(scaled - tile_max[:, None])
+        tile_denom = weights.sum(dim=-1)
+        tile_expected = (weights * scaled).sum(dim=-1)
+        tile_soft_embed = (
+            weights.to(embed_weight.dtype) @ embed_weight[start:end]
+        ).float()
+
+        new_max = torch.maximum(running_max, tile_max)
+        old_scale = torch.exp(running_max - new_max)
+        tile_scale = torch.exp(tile_max - new_max)
+        denom = denom * old_scale + tile_denom * tile_scale
+        expected = expected * old_scale + tile_expected * tile_scale
+        soft_embed = (
+            soft_embed * old_scale[:, None]
+            + tile_soft_embed * tile_scale[:, None]
+        )
+        running_max = new_max
+
+        tile_greedy_value = tile_max
+        tile_greedy_local = scaled.argmax(dim=-1)
+        tile_greedy_token = tile_greedy_local.to(torch.int64) + start
+        update_greedy = tile_greedy_value > greedy_value
+        greedy_value = torch.where(update_greedy, tile_greedy_value,
+                                   greedy_value)
+        greedy_token = torch.where(update_greedy, tile_greedy_token,
+                                   greedy_token)
+
+        if temperature > 0:
+            uniform = _stable_uniform_from_indices(row_offsets, token_offsets,
+                                                   seed)
+            noisy = scaled + (-torch.log(-torch.log(uniform)))
+        else:
+            noisy = scaled
+        tile_sample_value, tile_sample_local = noisy.max(dim=-1)
+        tile_sample_token = tile_sample_local.to(torch.int64) + start
+        update_sample = tile_sample_value > sample_value
+        sample_value = torch.where(update_sample, tile_sample_value,
+                                   sample_value)
+        sample_token = torch.where(update_sample, tile_sample_token,
+                                   sample_token)
+
+    lse = running_max + denom.log()
+    entropy = lse - expected / denom
+    return lse, entropy, sample_token, greedy_token, soft_embed / denom[:, None]
 
 
 def diffusion_gemma_merge_softcap_shard_states(

@@ -5,9 +5,14 @@ import pytest
 import torch
 
 from vllm.model_executor.models.diffusion_gemma_fused_lse import (
+    _stable_uniform_from_indices,
+    diffusion_gemma_merge_gumbel_shard_states,
     diffusion_gemma_merge_softcap_shard_states,
+    diffusion_gemma_softcap_gumbel_sample,
+    diffusion_gemma_softcap_gumbel_shard_state,
     diffusion_gemma_softcap_lse,
     diffusion_gemma_softcap_online_soft_embeds,
+    diffusion_gemma_softcap_online_sample_soft_embeds,
     diffusion_gemma_softcap_lse_entropy_argmax,
     diffusion_gemma_softcap_reductions_soft_embeds,
     diffusion_gemma_softcap_shard_state,
@@ -82,6 +87,24 @@ def _reference_soft_embeds_fp32(
     scaled = torch.tanh(logits / softcap) * softcap / temperature
     probs = scaled.softmax(dim=-1)
     return probs @ embed_weight.float()
+
+
+def _reference_gumbel_sample(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    softcap: float,
+    temperature: float,
+    seed: int,
+) -> torch.Tensor:
+    logits = hidden @ weight.t()
+    scaled = torch.tanh(logits.float() / softcap) * softcap / temperature
+    row_offsets = torch.arange(hidden.shape[0], device=hidden.device,
+                               dtype=torch.int64)
+    token_offsets = torch.arange(weight.shape[0], device=hidden.device,
+                                 dtype=torch.int64)
+    uniform = _stable_uniform_from_indices(row_offsets, token_offsets, seed)
+    gumbel = -torch.log(-torch.log(uniform))
+    return (scaled + gumbel).argmax(dim=-1)
 
 
 def _assert_selected_token_is_near_materialized_max(
@@ -564,6 +587,192 @@ def test_diffusion_gemma_tp_shard_merge_tie_breaks_to_lowest_token():
     torch.testing.assert_close(
         argmax_token, torch.tensor([2], device="cuda"), rtol=0, atol=0
     )
+
+
+def test_diffusion_gemma_chunked_gumbel_matches_materialized_reference():
+    hidden, weight = _make_inputs(rows=9, hidden_size=96, vocab_size=677)
+    expected = _reference_gumbel_sample(
+        hidden, weight, softcap=30.0, temperature=0.7, seed=20260624
+    )
+
+    for chunk_size in (1, 113, 256, 677):
+        actual = diffusion_gemma_softcap_gumbel_sample(
+            hidden,
+            weight,
+            softcap=30.0,
+            temperature=0.7,
+            seed=20260624,
+            chunk_size=chunk_size,
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_diffusion_gemma_chunked_gumbel_is_shard_layout_stable():
+    hidden, weight = _make_inputs(rows=7, hidden_size=80, vocab_size=541)
+    expected = diffusion_gemma_softcap_gumbel_sample(
+        hidden,
+        weight,
+        softcap=30.0,
+        temperature=0.7,
+        seed=20260625,
+        chunk_size=97,
+    )
+
+    for num_shards in (1, 3, 8):
+        shard_size = (weight.shape[0] + num_shards - 1) // num_shards
+        states = []
+        for shard_idx in range(num_shards):
+            start = shard_idx * shard_size
+            end = min(start + shard_size, weight.shape[0])
+            if start == end:
+                continue
+            states.append(
+                diffusion_gemma_softcap_gumbel_shard_state(
+                    hidden,
+                    weight[start:end],
+                    softcap=30.0,
+                    temperature=0.7,
+                    seed=20260625,
+                    vocab_start=start,
+                    chunk_size=53,
+                )
+            )
+        actual = diffusion_gemma_merge_gumbel_shard_states(states)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_diffusion_gemma_chunked_gumbel_handles_empty_rows():
+    hidden = torch.empty((0, 64), device="cuda", dtype=torch.bfloat16)
+    weight = torch.empty((257, 64), device="cuda", dtype=torch.bfloat16)
+
+    actual = diffusion_gemma_softcap_gumbel_sample(
+        hidden,
+        weight,
+        softcap=30.0,
+        temperature=0.7,
+        seed=20260626,
+    )
+
+    assert actual.shape == (0,)
+    assert actual.dtype == torch.int64
+
+
+def test_diffusion_gemma_chunked_gumbel_temperature_zero_is_greedy():
+    hidden, weight = _make_inputs(rows=5, hidden_size=64, vocab_size=257)
+    expected = _reference_softcap_reductions(
+        hidden, weight, softcap=30.0, temperature=1.0
+    )[2]
+
+    actual = diffusion_gemma_softcap_gumbel_sample(
+        hidden,
+        weight,
+        softcap=30.0,
+        temperature=0.0,
+        seed=20260629,
+        chunk_size=31,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_diffusion_gemma_chunked_gumbel_matches_softmax_distribution():
+    rows = 8192
+    scores = torch.tensor(
+        [-2.0, -1.0, -0.3, 0.0, 0.4, 0.8, 1.2, 2.0],
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    hidden = torch.ones((rows, 1), device="cuda", dtype=torch.bfloat16)
+    weight = scores[:, None].contiguous()
+
+    samples = diffusion_gemma_softcap_gumbel_sample(
+        hidden,
+        weight,
+        softcap=30.0,
+        temperature=1.0,
+        seed=20260628,
+        chunk_size=3,
+    )
+
+    freq = torch.bincount(samples, minlength=scores.numel()).float() / rows
+    scaled = torch.tanh(scores.float() / 30.0) * 30.0
+    expected = scaled.softmax(dim=-1)
+    total_variation = 0.5 * (freq - expected).abs().sum()
+    assert total_variation.item() < 0.03
+
+
+def test_diffusion_gemma_online_sample_soft_embeds_matches_component_helpers():
+    hidden, weight = _make_inputs(rows=13, hidden_size=96, vocab_size=733)
+    embed_weight = _make_embed_weight(vocab_size=733, embed_size=48,
+                                      seed=20260630)
+
+    actual = diffusion_gemma_softcap_online_sample_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=30.0,
+        temperature=0.7,
+        seed=20260631,
+        soft_embed_chunk_size=97,
+    )
+    expected_lse, expected_entropy, expected_argmax, expected_soft = (
+        diffusion_gemma_softcap_online_soft_embeds(
+            hidden,
+            weight,
+            embed_weight,
+            softcap=30.0,
+            temperature=0.7,
+            soft_embed_chunk_size=97,
+        )
+    )
+    expected_sample = diffusion_gemma_softcap_gumbel_sample(
+        hidden,
+        weight,
+        softcap=30.0,
+        temperature=0.7,
+        seed=20260631,
+        chunk_size=97,
+    )
+
+    torch.testing.assert_close(actual[0], expected_lse, rtol=0, atol=0)
+    torch.testing.assert_close(actual[1], expected_entropy, rtol=0, atol=0)
+    torch.testing.assert_close(actual[2], expected_sample, rtol=0, atol=0)
+    torch.testing.assert_close(actual[3], expected_argmax, rtol=0, atol=0)
+    torch.testing.assert_close(actual[4], expected_soft, rtol=0, atol=0)
+
+
+def test_diffusion_gemma_online_sample_soft_embeds_chunk_size_invariant():
+    hidden, weight = _make_inputs(rows=7, hidden_size=80, vocab_size=541)
+    embed_weight = _make_embed_weight(vocab_size=541, embed_size=32,
+                                      seed=20260632)
+    expected = diffusion_gemma_softcap_online_sample_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=30.0,
+        temperature=0.7,
+        seed=20260633,
+        soft_embed_chunk_size=541,
+    )
+
+    for chunk_size in (1, 53, 128):
+        actual = diffusion_gemma_softcap_online_sample_soft_embeds(
+            hidden,
+            weight,
+            embed_weight,
+            softcap=30.0,
+            temperature=0.7,
+            seed=20260633,
+            soft_embed_chunk_size=chunk_size,
+        )
+        torch.testing.assert_close(actual[0], expected[0], rtol=3e-4,
+                                   atol=2e-3)
+        torch.testing.assert_close(actual[1], expected[1], rtol=1e-3,
+                                   atol=1e-3)
+        torch.testing.assert_close(actual[2], expected[2], rtol=0, atol=0)
+        torch.testing.assert_close(actual[3], expected[3], rtol=0, atol=0)
+        torch.testing.assert_close(actual[4], expected[4], rtol=2e-2,
+                                   atol=2e-2)
 
 
 def test_diffusion_gemma_softcap_lse_entropy_argmax_avoids_full_vocab_peak_memory():
