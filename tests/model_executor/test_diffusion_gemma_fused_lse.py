@@ -4,8 +4,13 @@
 import pytest
 import torch
 
+from vllm.model_executor.models.diffusion_gemma import (
+    _get_diffusion_gemma_streamed_backend,
+    _resolve_diffusion_gemma_streamed_backend_for_rows,
+)
 from vllm.model_executor.models.diffusion_gemma_fused_lse import (
     _stable_uniform_from_indices,
+    diffusion_gemma_softcap_cublas_two_pass_sample_soft_embeds,
     diffusion_gemma_merge_gumbel_shard_states,
     diffusion_gemma_merge_softcap_shard_states,
     diffusion_gemma_softcap_gumbel_sample,
@@ -13,7 +18,10 @@ from vllm.model_executor.models.diffusion_gemma_fused_lse import (
     diffusion_gemma_softcap_lse,
     diffusion_gemma_softcap_online_soft_embeds,
     diffusion_gemma_softcap_online_sample_soft_embeds,
+    diffusion_gemma_softcap_row_chunked_sample_soft_embeds,
     diffusion_gemma_softcap_lse_entropy_argmax,
+    diffusion_gemma_softcap_triton_sample_soft_embeds,
+    diffusion_gemma_softcap_triton_single_pass_sample_soft_embeds,
     diffusion_gemma_softcap_reductions_soft_embeds,
     diffusion_gemma_softcap_shard_state,
 )
@@ -22,6 +30,65 @@ from vllm.model_executor.models.diffusion_gemma_fused_lse import (
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required for Triton LSE tests"
 )
+
+
+def test_diffusion_gemma_streamed_backend_validation(monkeypatch):
+    monkeypatch.delenv("VLLM_DIFFUSION_GEMMA_STREAMED_BACKEND", raising=False)
+    monkeypatch.delenv(
+        "VLLM_DIFFUSION_GEMMA_ALLOW_EXPERIMENTAL_TRITON", raising=False
+    )
+    assert _get_diffusion_gemma_streamed_backend() == "eager"
+
+    for backend in ("auto", "eager", "cublas_two_pass", "row_chunked"):
+        monkeypatch.setenv("VLLM_DIFFUSION_GEMMA_STREAMED_BACKEND", backend)
+        assert _get_diffusion_gemma_streamed_backend() == backend
+
+    monkeypatch.setenv("VLLM_DIFFUSION_GEMMA_STREAMED_BACKEND", "triton_full")
+    monkeypatch.delenv(
+        "VLLM_DIFFUSION_GEMMA_ALLOW_EXPERIMENTAL_TRITON", raising=False
+    )
+    with pytest.raises(ValueError, match="experimental"):
+        _get_diffusion_gemma_streamed_backend()
+
+    monkeypatch.setenv(
+        "VLLM_DIFFUSION_GEMMA_ALLOW_EXPERIMENTAL_TRITON", "1"
+    )
+    assert _get_diffusion_gemma_streamed_backend() == "triton_full"
+
+    monkeypatch.setenv("VLLM_DIFFUSION_GEMMA_STREAMED_BACKEND", "typo")
+    with pytest.raises(ValueError, match="Unsupported"):
+        _get_diffusion_gemma_streamed_backend()
+
+
+def test_diffusion_gemma_streamed_auto_backend_boundary(monkeypatch):
+    monkeypatch.delenv(
+        "VLLM_DIFFUSION_GEMMA_STREAMED_AUTO_MAX_MATERIALIZED_ROWS",
+        raising=False,
+    )
+    assert (
+        _resolve_diffusion_gemma_streamed_backend_for_rows("auto", 2048)
+        == "materialized"
+    )
+    assert (
+        _resolve_diffusion_gemma_streamed_backend_for_rows("auto", 2049)
+        == "row_chunked"
+    )
+    assert (
+        _resolve_diffusion_gemma_streamed_backend_for_rows("row_chunked", 1)
+        == "row_chunked"
+    )
+
+    monkeypatch.setenv(
+        "VLLM_DIFFUSION_GEMMA_STREAMED_AUTO_MAX_MATERIALIZED_ROWS", "3072"
+    )
+    assert (
+        _resolve_diffusion_gemma_streamed_backend_for_rows("auto", 3072)
+        == "materialized"
+    )
+    assert (
+        _resolve_diffusion_gemma_streamed_backend_for_rows("auto", 3073)
+        == "row_chunked"
+    )
 
 
 def _reference_softcap_reductions(
@@ -773,6 +840,490 @@ def test_diffusion_gemma_online_sample_soft_embeds_chunk_size_invariant():
         torch.testing.assert_close(actual[3], expected[3], rtol=0, atol=0)
         torch.testing.assert_close(actual[4], expected[4], rtol=2e-2,
                                    atol=2e-2)
+
+
+def test_diffusion_gemma_online_sample_soft_embeds_accepts_row_temperature():
+    hidden, weight = _make_inputs(rows=6, hidden_size=64, vocab_size=257)
+    embed_weight = _make_embed_weight(vocab_size=257, embed_size=32,
+                                      seed=20260634)
+    temperature = torch.tensor(
+        [0.3, 0.5, 0.7, 1.0, 1.3, 0.0], device="cuda", dtype=torch.float32
+    )
+
+    actual = diffusion_gemma_softcap_online_sample_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=30.0,
+        temperature=temperature,
+        seed=20260635,
+        soft_embed_chunk_size=63,
+    )
+
+    for row, temp in enumerate(temperature.tolist()):
+        expected = diffusion_gemma_softcap_online_sample_soft_embeds(
+            hidden,
+            weight,
+            embed_weight,
+            softcap=30.0,
+            temperature=temp,
+            seed=20260635,
+            soft_embed_chunk_size=63,
+        )
+        for idx in (0, 1, 2, 3, 4):
+            torch.testing.assert_close(
+                actual[idx][row : row + 1],
+                expected[idx][row : row + 1],
+                rtol=2e-2 if idx == 4 else 1e-3,
+                atol=2e-2 if idx == 4 else 2e-3,
+            )
+
+
+
+
+def test_diffusion_gemma_cublas_two_pass_sample_soft_embeds_matches_online():
+    hidden, weight = _make_inputs(rows=7, hidden_size=96, vocab_size=677)
+    embed_weight = _make_embed_weight(vocab_size=677, embed_size=48,
+                                      seed=20260642)
+    temperature = torch.tensor(
+        [0.3, 0.5, 0.7, 1.0, 1.3, 0.9, 0.8], device="cuda",
+        dtype=torch.float32,
+    )
+
+    expected = diffusion_gemma_softcap_online_sample_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=30.0,
+        temperature=temperature,
+        seed=20260643,
+        soft_embed_chunk_size=113,
+    )
+    actual = diffusion_gemma_softcap_cublas_two_pass_sample_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=30.0,
+        temperature=temperature,
+        seed=20260643,
+        chunk_size=113,
+    )
+
+    torch.testing.assert_close(actual[0], expected[0], rtol=3e-4, atol=2e-3)
+    torch.testing.assert_close(actual[1], expected[1], rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(actual[2], expected[2], rtol=0, atol=0)
+    torch.testing.assert_close(actual[3], expected[3], rtol=0, atol=0)
+    torch.testing.assert_close(actual[4], expected[4], rtol=2e-2, atol=2e-2)
+
+
+def test_diffusion_gemma_cublas_two_pass_chunk_size_invariant():
+    hidden, weight = _make_inputs(rows=5, hidden_size=64, vocab_size=257)
+    embed_weight = _make_embed_weight(vocab_size=257, embed_size=32,
+                                      seed=20260644)
+    expected = diffusion_gemma_softcap_cublas_two_pass_sample_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=30.0,
+        temperature=0.7,
+        seed=20260645,
+        chunk_size=257,
+    )
+
+    for chunk_size in (1, 63, 128):
+        actual = diffusion_gemma_softcap_cublas_two_pass_sample_soft_embeds(
+            hidden,
+            weight,
+            embed_weight,
+            softcap=30.0,
+            temperature=0.7,
+            seed=20260645,
+            chunk_size=chunk_size,
+        )
+        torch.testing.assert_close(actual[0], expected[0], rtol=3e-4,
+                                   atol=2e-3)
+        torch.testing.assert_close(actual[1], expected[1], rtol=1e-3,
+                                   atol=1e-3)
+        torch.testing.assert_close(actual[2], expected[2], rtol=0, atol=0)
+        torch.testing.assert_close(actual[3], expected[3], rtol=0, atol=0)
+        torch.testing.assert_close(actual[4], expected[4], rtol=2e-2,
+                                   atol=2e-2)
+
+
+def test_diffusion_gemma_cublas_two_pass_temp_zero_is_deterministic_one_hot():
+    hidden, weight = _make_inputs(rows=4, hidden_size=64, vocab_size=257)
+    embed_weight = _make_embed_weight(vocab_size=257, embed_size=32,
+                                      seed=20260646)
+    temperature = torch.tensor([0.0, 0.7, 0.0, 1.1], device="cuda",
+                               dtype=torch.float32)
+
+    actual = diffusion_gemma_softcap_cublas_two_pass_sample_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=30.0,
+        temperature=temperature,
+        seed=20260647,
+        chunk_size=64,
+    )
+    zero_rows = temperature == 0
+    torch.testing.assert_close(actual[2][zero_rows], actual[3][zero_rows],
+                               rtol=0, atol=0)
+    torch.testing.assert_close(actual[1][zero_rows],
+                               torch.zeros_like(actual[1][zero_rows]),
+                               rtol=0, atol=0)
+    torch.testing.assert_close(
+        actual[4][zero_rows],
+        embed_weight[actual[3][zero_rows]].float(),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_diffusion_gemma_cublas_two_pass_matches_materialized_fp32_reference():
+    hidden, weight = _make_inputs(rows=6, hidden_size=96, vocab_size=389)
+    embed_weight = _make_embed_weight(vocab_size=389, embed_size=40,
+                                      seed=20260648)
+    temperature = 0.7
+
+    actual = diffusion_gemma_softcap_cublas_two_pass_sample_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=30.0,
+        temperature=temperature,
+        seed=20260649,
+        chunk_size=97,
+    )
+    expected_lse, expected_entropy, expected_argmax = _reference_softcap_reductions(
+        hidden, weight, softcap=30.0, temperature=temperature
+    )
+    expected_sample = _reference_gumbel_sample(
+        hidden, weight, softcap=30.0, temperature=temperature, seed=20260649
+    )
+    expected_soft = _reference_soft_embeds_fp32(
+        hidden, weight, embed_weight, softcap=30.0, temperature=temperature
+    )
+
+    torch.testing.assert_close(actual[0], expected_lse, rtol=3e-4, atol=2e-3)
+    torch.testing.assert_close(actual[1], expected_entropy, rtol=1e-3,
+                               atol=1e-3)
+    torch.testing.assert_close(actual[2], expected_sample, rtol=0, atol=0)
+    torch.testing.assert_close(actual[3], expected_argmax, rtol=0, atol=0)
+    torch.testing.assert_close(actual[4], expected_soft, rtol=5e-2, atol=5e-2)
+
+
+def test_diffusion_gemma_cublas_two_pass_row_seed_offsets_are_reorder_stable():
+    hidden, weight = _make_inputs(rows=8, hidden_size=80, vocab_size=541)
+    embed_weight = _make_embed_weight(vocab_size=541, embed_size=32,
+                                      seed=20260650)
+    row_seed_offsets = torch.tensor([11, 3, 20, 7, 15, 99, 2, 42],
+                                    device="cuda", dtype=torch.int64)
+    temperature = torch.full((8,), 0.7, device="cuda", dtype=torch.float32)
+    expected = diffusion_gemma_softcap_cublas_two_pass_sample_soft_embeds(
+        hidden, weight, embed_weight, softcap=30.0, temperature=temperature,
+        seed=20260651, chunk_size=113, row_seed_offsets=row_seed_offsets,
+    )
+
+    perm = torch.tensor([5, 0, 7, 1, 6, 2, 4, 3], device="cuda")
+    inv = torch.empty_like(perm)
+    inv[perm] = torch.arange(perm.numel(), device="cuda")
+    actual = diffusion_gemma_softcap_cublas_two_pass_sample_soft_embeds(
+        hidden[perm], weight, embed_weight, softcap=30.0,
+        temperature=temperature[perm], seed=20260651, chunk_size=113,
+        row_seed_offsets=row_seed_offsets[perm],
+    )
+
+    for idx in (0, 1, 2, 3, 4):
+        tol = {0: (3e-4, 2e-3), 1: (1e-3, 1e-3), 4: (2e-2, 2e-2)}.get(idx, (0, 0))
+        torch.testing.assert_close(actual[idx][inv], expected[idx],
+                                   rtol=tol[0], atol=tol[1])
+
+
+def test_diffusion_gemma_row_chunked_sample_soft_embeds_matches_cublas():
+    hidden, weight = _make_inputs(rows=9, hidden_size=96, vocab_size=677)
+    embed_weight = _make_embed_weight(vocab_size=677, embed_size=48,
+                                      seed=20260652)
+    temperature = torch.tensor(
+        [0.3, 0.5, 0.7, 1.0, 1.3, 0.9, 0.8, 0.0, 1.1],
+        device="cuda",
+        dtype=torch.float32,
+    )
+    row_seed_offsets = torch.tensor([8, 1, 7, 3, 5, 11, 13, 17, 19],
+                                    device="cuda", dtype=torch.int64)
+
+    expected = diffusion_gemma_softcap_cublas_two_pass_sample_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=30.0,
+        temperature=temperature,
+        seed=20260653,
+        chunk_size=113,
+        row_seed_offsets=row_seed_offsets,
+    )
+    actual = diffusion_gemma_softcap_row_chunked_sample_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=30.0,
+        temperature=temperature,
+        seed=20260653,
+        row_chunk_size=4,
+        row_seed_offsets=row_seed_offsets,
+    )
+
+    torch.testing.assert_close(actual[0], expected[0], rtol=3e-4, atol=2e-3)
+    torch.testing.assert_close(actual[1], expected[1], rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(actual[2], expected[2], rtol=0, atol=0)
+    torch.testing.assert_close(actual[3], expected[3], rtol=0, atol=0)
+    torch.testing.assert_close(actual[4], expected[4], rtol=2e-2, atol=2e-2)
+
+
+def test_diffusion_gemma_row_chunked_chunk_size_invariant():
+    hidden, weight = _make_inputs(rows=7, hidden_size=64, vocab_size=257)
+    embed_weight = _make_embed_weight(vocab_size=257, embed_size=32,
+                                      seed=20260654)
+    temperature = torch.tensor([0.3, 0.5, 0.7, 1.0, 0.0, 0.9, 1.1],
+                               device="cuda", dtype=torch.float32)
+    expected = diffusion_gemma_softcap_row_chunked_sample_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=30.0,
+        temperature=temperature,
+        seed=20260655,
+        row_chunk_size=7,
+    )
+
+    for row_chunk_size in (1, 2, 3):
+        actual = diffusion_gemma_softcap_row_chunked_sample_soft_embeds(
+            hidden,
+            weight,
+            embed_weight,
+            softcap=30.0,
+            temperature=temperature,
+            seed=20260655,
+            row_chunk_size=row_chunk_size,
+        )
+        torch.testing.assert_close(actual[0], expected[0], rtol=3e-4,
+                                   atol=2e-3)
+        torch.testing.assert_close(actual[1], expected[1], rtol=1e-3,
+                                   atol=1e-3)
+        torch.testing.assert_close(actual[2], expected[2], rtol=0, atol=0)
+        torch.testing.assert_close(actual[3], expected[3], rtol=0, atol=0)
+        torch.testing.assert_close(actual[4], expected[4], rtol=2e-2,
+                                   atol=2e-2)
+
+
+def test_diffusion_gemma_row_chunked_temp_zero_matches_online_boundary():
+    hidden, weight = _make_inputs(rows=5, hidden_size=64, vocab_size=257)
+    embed_weight = _make_embed_weight(vocab_size=257, embed_size=32,
+                                      seed=20260656)
+    temperature = torch.tensor([0.0, 0.7, 0.0, 1.1, 0.0], device="cuda",
+                               dtype=torch.float32)
+
+    expected = diffusion_gemma_softcap_online_sample_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=30.0,
+        temperature=temperature,
+        seed=20260657,
+        soft_embed_chunk_size=63,
+    )
+    actual = diffusion_gemma_softcap_row_chunked_sample_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=30.0,
+        temperature=temperature,
+        seed=20260657,
+        row_chunk_size=2,
+    )
+
+    zero_rows = temperature == 0
+    torch.testing.assert_close(actual[2][zero_rows], actual[3][zero_rows],
+                               rtol=0, atol=0)
+    torch.testing.assert_close(actual[3], expected[3], rtol=0, atol=0)
+    torch.testing.assert_close(actual[4][zero_rows],
+                               expected[4][zero_rows],
+                               rtol=2e-2, atol=2e-2)
+
+
+def test_diffusion_gemma_triton_single_pass_matches_reference():
+    hidden, weight = _make_inputs(rows=5, hidden_size=64, vocab_size=257)
+    embed_weight = _make_embed_weight(vocab_size=257, embed_size=48,
+                                      seed=20260640)
+    temperature = torch.full((5,), 0.7, device="cuda", dtype=torch.float32)
+
+    actual = diffusion_gemma_softcap_triton_single_pass_sample_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=30.0,
+        temperature=temperature,
+        seed=20260641,
+        block_m=2,
+        block_n=64,
+        block_k=32,
+        block_e=32,
+    )
+    expected_lse, expected_entropy, expected_argmax = _reference_softcap_reductions(
+        hidden, weight, softcap=30.0, temperature=0.7
+    )
+    expected_soft = _reference_soft_embeds(
+        hidden, weight, embed_weight, softcap=30.0, temperature=0.7
+    )
+
+    torch.testing.assert_close(actual[0], expected_lse, rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(actual[1], expected_entropy, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(actual[3], expected_argmax, rtol=0, atol=0)
+    torch.testing.assert_close(actual[4], expected_soft, rtol=2e-2, atol=2e-2)
+    assert ((actual[2] >= 0) & (actual[2] < weight.shape[0])).all()
+
+
+def test_diffusion_gemma_triton_sample_soft_embeds_matches_reference():
+    hidden, weight = _make_inputs(rows=5, hidden_size=64, vocab_size=257)
+    embed_weight = _make_embed_weight(vocab_size=257, embed_size=48,
+                                      seed=20260636)
+    temperature = torch.full((5,), 0.7, device="cuda", dtype=torch.float32)
+
+    actual = diffusion_gemma_softcap_triton_sample_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=30.0,
+        temperature=temperature,
+        seed=20260637,
+        block_m=4,
+        block_n=64,
+        block_k=32,
+        block_e=32,
+    )
+    expected_lse, expected_entropy, expected_argmax = _reference_softcap_reductions(
+        hidden, weight, softcap=30.0, temperature=0.7
+    )
+    expected_soft = _reference_soft_embeds(
+        hidden, weight, embed_weight, softcap=30.0, temperature=0.7
+    )
+
+    torch.testing.assert_close(actual[0], expected_lse, rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(actual[1], expected_entropy, rtol=1e-3, atol=1e-3)
+    _assert_selected_token_is_near_materialized_max(
+        hidden, weight, actual[3], softcap=30.0, temperature=0.7
+    )
+    torch.testing.assert_close(actual[3], expected_argmax, rtol=0, atol=0)
+    torch.testing.assert_close(actual[4], expected_soft, rtol=2e-2, atol=2e-2)
+    assert actual[2].shape == expected_argmax.shape
+    assert ((actual[2] >= 0) & (actual[2] < weight.shape[0])).all()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Triton projection semantics can drift beyond the sampler entropy "
+        "threshold at large vocab/low temperature; keep triton_full "
+        "experimental, not exact."
+    ),
+)
+def test_diffusion_gemma_triton_sample_large_vocab_low_temp_matches_cublas_greedy():
+    # Council gate: exercise the full-output Triton path at larger vocab and
+    # low temperature so softcap/tail-mass behavior is tested beyond the tiny
+    # unit shapes. Sample tokens are not compared because Triton uses a
+    # prototype inline RNG stream; greedy/LSE/entropy/soft_embed must match.
+    hidden, weight = _make_inputs(rows=3, hidden_size=64, vocab_size=32768)
+    embed_weight = _make_embed_weight(vocab_size=32768, embed_size=32,
+                                      seed=20260658)
+    temperature = torch.full((3,), 0.2, device="cuda", dtype=torch.float32)
+
+    expected = diffusion_gemma_softcap_cublas_two_pass_sample_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=30.0,
+        temperature=temperature,
+        seed=20260659,
+        chunk_size=4096,
+    )
+    actual = diffusion_gemma_softcap_triton_sample_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=30.0,
+        temperature=temperature,
+        seed=20260659,
+        block_m=4,
+        block_n=128,
+        block_k=32,
+        block_e=32,
+    )
+
+    torch.testing.assert_close(actual[0], expected[0], rtol=3e-4, atol=2e-3)
+    torch.testing.assert_close(actual[1], expected[1], rtol=1e-3, atol=2e-3)
+    torch.testing.assert_close(actual[3], expected[3], rtol=0, atol=0)
+    torch.testing.assert_close(actual[4], expected[4], rtol=2e-2, atol=2e-2)
+    assert ((actual[2] >= 0) & (actual[2] < weight.shape[0])).all()
+
+
+def test_diffusion_gemma_triton_sample_greedy_stable_when_rng_seed_aliases():
+    # The Triton prototype truncates seed internally for its sampling RNG.
+    # Document that sampled tokens are backend-specific while deterministic
+    # greedy state remains aligned with the cublas/row_chunked reference.
+    hidden, weight = _make_inputs(rows=4, hidden_size=64, vocab_size=4097)
+    embed_weight = _make_embed_weight(vocab_size=4097, embed_size=32,
+                                      seed=20260660)
+    temperature = torch.full((4,), 0.7, device="cuda", dtype=torch.float32)
+    seed = 20260661 + 65536
+
+    expected = diffusion_gemma_softcap_cublas_two_pass_sample_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=30.0,
+        temperature=temperature,
+        seed=seed,
+        chunk_size=1024,
+    )
+    actual = diffusion_gemma_softcap_triton_sample_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=30.0,
+        temperature=temperature,
+        seed=seed,
+        block_m=4,
+        block_n=128,
+        block_k=32,
+        block_e=32,
+    )
+
+    torch.testing.assert_close(actual[0], expected[0], rtol=3e-4, atol=2e-3)
+    torch.testing.assert_close(actual[1], expected[1], rtol=1e-3, atol=2e-3)
+    torch.testing.assert_close(actual[3], expected[3], rtol=0, atol=0)
+    torch.testing.assert_close(actual[4], expected[4], rtol=2e-2, atol=2e-2)
+    assert ((actual[2] >= 0) & (actual[2] < weight.shape[0])).all()
+
+
+def test_diffusion_gemma_triton_sample_temperature_zero_is_greedy():
+    hidden, weight = _make_inputs(rows=4, hidden_size=48, vocab_size=193)
+    embed_weight = _make_embed_weight(vocab_size=193, embed_size=32,
+                                      seed=20260638)
+    temperature = torch.zeros((4,), device="cuda", dtype=torch.float32)
+
+    actual = diffusion_gemma_softcap_triton_sample_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=30.0,
+        temperature=temperature,
+        seed=20260639,
+        block_m=4,
+        block_n=64,
+        block_k=32,
+        block_e=32,
+    )
+    torch.testing.assert_close(actual[2], actual[3], rtol=0, atol=0)
 
 
 def test_diffusion_gemma_softcap_lse_entropy_argmax_avoids_full_vocab_peak_memory():
