@@ -19,6 +19,7 @@ import triton.language as tl
 _DEFAULT_BLOCK_M = 32
 _DEFAULT_BLOCK_N = 128
 _DEFAULT_BLOCK_K = 64
+_DEFAULT_SOFT_EMBED_CHUNK = 8192
 _DEFAULT_NUM_WARPS = 8
 
 
@@ -184,6 +185,75 @@ def diffusion_gemma_softcap_lse_entropy_argmax(
         1, argmax_block[:, None]
     ).squeeze(1)
     return lse, entropy, argmax_tokens
+
+
+def diffusion_gemma_softcap_reductions_soft_embeds(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    embed_weight: torch.Tensor,
+    softcap: float,
+    temperature: float,
+    *,
+    block_m: int = _DEFAULT_BLOCK_M,
+    block_n: int = _DEFAULT_BLOCK_N,
+    block_k: int = _DEFAULT_BLOCK_K,
+    soft_embed_chunk_size: int = _DEFAULT_SOFT_EMBED_CHUNK,
+    num_warps: int = _DEFAULT_NUM_WARPS,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute softcapped reductions plus chunked soft embeddings.
+
+    The row reductions use the fused Triton helper. Soft embeddings use a
+    chunked tensor-core bridge: recompute softcapped logits over vocab chunks,
+    multiply probabilities and embedding weights in bf16, and accumulate chunks
+    in fp32. This avoids full ``[rows, vocab]`` logits/probabilities while
+    preserving the numerics needed for the later fully fused kernel.
+    """
+    lse, entropy, argmax_tokens = diffusion_gemma_softcap_lse_entropy_argmax(
+        hidden,
+        weight,
+        softcap,
+        temperature,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        num_warps=num_warps,
+    )
+
+    if embed_weight.ndim != 2:
+        raise ValueError("embed_weight must be a rank-2 tensor")
+    if embed_weight.shape[0] != weight.shape[0]:
+        raise ValueError("embed_weight vocab dimension must match weight")
+    if not embed_weight.is_cuda:
+        raise ValueError("embed_weight must be a CUDA tensor")
+    if embed_weight.dtype != torch.bfloat16:
+        raise ValueError("embed_weight must be bfloat16 for this prototype")
+    if soft_embed_chunk_size <= 0:
+        raise ValueError("soft_embed_chunk_size must be positive")
+
+    rows = hidden.shape[0]
+    embed_size = embed_weight.shape[1]
+    if rows == 0:
+        soft_embeds = torch.empty(
+            (0, embed_size), device=hidden.device, dtype=torch.float32
+        )
+        return lse, entropy, argmax_tokens, soft_embeds
+
+    hidden = hidden.contiguous()
+    weight = weight.contiguous()
+    embed_weight = embed_weight.contiguous()
+    vocab_size = weight.shape[0]
+    soft_embeds = torch.zeros(
+        (rows, embed_size), device=hidden.device, dtype=torch.float32
+    )
+    for start in range(0, vocab_size, soft_embed_chunk_size):
+        end = min(start + soft_embed_chunk_size, vocab_size)
+        logits = hidden @ weight[start:end].t()
+        scaled = torch.tanh(logits.float() / softcap) * softcap / temperature
+        probs = torch.exp(scaled - lse[:, None])
+        soft_embeds.add_(
+            (probs.to(embed_weight.dtype) @ embed_weight[start:end]).float()
+        )
+    return lse, entropy, argmax_tokens, soft_embeds
 
 
 def diffusion_gemma_softcap_lse(

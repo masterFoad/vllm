@@ -7,6 +7,7 @@ import torch
 from vllm.model_executor.models.diffusion_gemma_fused_lse import (
     diffusion_gemma_softcap_lse,
     diffusion_gemma_softcap_lse_entropy_argmax,
+    diffusion_gemma_softcap_reductions_soft_embeds,
 )
 
 
@@ -41,6 +42,30 @@ def _make_inputs(
         vocab_size, hidden_size, device="cuda", dtype=torch.bfloat16
     ) / hidden_size**0.5
     return hidden, weight
+
+
+def _make_embed_weight(
+    vocab_size: int,
+    embed_size: int,
+    seed: int,
+) -> torch.Tensor:
+    torch.manual_seed(seed)
+    return torch.randn(
+        vocab_size, embed_size, device="cuda", dtype=torch.bfloat16
+    ) / embed_size**0.5
+
+
+def _reference_soft_embeds(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    embed_weight: torch.Tensor,
+    softcap: float,
+    temperature: float,
+) -> torch.Tensor:
+    logits = hidden @ weight.t()
+    scaled = torch.tanh(logits.float() / softcap) * softcap / temperature
+    probs = scaled.softmax(dim=-1)
+    return (probs.to(embed_weight.dtype) @ embed_weight).float()
 
 
 def _assert_selected_token_is_near_materialized_max(
@@ -161,6 +186,96 @@ def test_diffusion_gemma_softcap_lse_entropy_argmax_handles_empty_rows():
     assert lse.dtype == torch.float32
     assert entropy.dtype == torch.float32
     assert argmax.dtype == torch.int64
+
+
+def test_diffusion_gemma_softcap_reductions_soft_embeds_matches_reference():
+    hidden, weight = _make_inputs(rows=19, hidden_size=128, vocab_size=769)
+    embed_weight = _make_embed_weight(vocab_size=769, embed_size=96,
+                                      seed=20260616)
+
+    actual = diffusion_gemma_softcap_reductions_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=30.0,
+        temperature=0.7,
+        block_m=16,
+        block_n=128,
+        block_k=64,
+        soft_embed_chunk_size=256,
+        num_warps=4,
+    )
+    expected_lse, expected_entropy, _ = _reference_softcap_reductions(
+        hidden, weight, softcap=30.0, temperature=0.7
+    )
+    expected_soft_embeds = _reference_soft_embeds(
+        hidden, weight, embed_weight, softcap=30.0, temperature=0.7
+    )
+
+    torch.testing.assert_close(actual[0], expected_lse, rtol=3e-4, atol=2e-3)
+    torch.testing.assert_close(actual[1], expected_entropy, rtol=1e-3,
+                               atol=1e-3)
+    _assert_selected_token_is_near_materialized_max(
+        hidden, weight, actual[2], softcap=30.0, temperature=0.7
+    )
+    torch.testing.assert_close(actual[3], expected_soft_embeds, rtol=2e-2,
+                               atol=2e-2)
+    assert actual[3].dtype == torch.float32
+
+
+def test_diffusion_gemma_softcap_reductions_soft_embeds_handles_empty_rows():
+    hidden = torch.empty((0, 64), device="cuda", dtype=torch.bfloat16)
+    weight = torch.empty((257, 64), device="cuda", dtype=torch.bfloat16)
+    embed_weight = torch.empty((257, 48), device="cuda", dtype=torch.bfloat16)
+
+    lse, entropy, argmax, soft_embeds = (
+        diffusion_gemma_softcap_reductions_soft_embeds(
+            hidden, weight, embed_weight, softcap=30.0, temperature=0.7
+        )
+    )
+
+    assert lse.shape == (0,)
+    assert entropy.shape == (0,)
+    assert argmax.shape == (0,)
+    assert soft_embeds.shape == (0, 48)
+    assert soft_embeds.dtype == torch.float32
+
+
+def test_diffusion_gemma_softcap_reductions_soft_embeds_memory():
+    rows = 128
+    hidden_size = 256
+    vocab_size = 16384
+    embed_size = 256
+    hidden, weight = _make_inputs(rows, hidden_size, vocab_size)
+    embed_weight = _make_embed_weight(vocab_size, embed_size, seed=20260617)
+
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    expected = _reference_soft_embeds(
+        hidden, weight, embed_weight, softcap=30.0, temperature=0.7
+    )
+    torch.cuda.synchronize()
+    full_peak = torch.cuda.max_memory_allocated() - base
+
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    actual = diffusion_gemma_softcap_reductions_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=30.0,
+        temperature=0.7,
+        soft_embed_chunk_size=1024,
+    )
+    torch.cuda.synchronize()
+    fused_peak = torch.cuda.max_memory_allocated() - base
+
+    torch.testing.assert_close(actual[3], expected, rtol=2e-2, atol=2e-2)
+    assert fused_peak < full_peak / 2
 
 
 def test_diffusion_gemma_softcap_lse_entropy_argmax_avoids_full_vocab_peak_memory():
