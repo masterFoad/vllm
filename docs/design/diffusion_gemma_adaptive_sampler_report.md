@@ -11,7 +11,8 @@ We started by trying to reduce DiffusionGemma sampler memory without hurting
 serving throughput. The useful result is not a universal speedup. The useful
 result is an **adaptive exact sampler backend** that keeps the fast materialized
 path for normal batch sizes and switches to bounded row-chunking only when the
-number of sampler rows is large enough to risk CUDA OOM.
+number of sampler rows exceeds a configured threshold chosen as an OOM-risk
+proxy for the tested high-pressure shape.
 
 The headline evidence from OpenShift/A100 testing:
 
@@ -20,6 +21,10 @@ The headline evidence from OpenShift/A100 testing:
 - High-pressure serving with `--max-num-batched-tokens 4096 --max-num-seqs 16`:
   the baseline materialized path OOMed at client concurrency 12 and 16, while
   the adaptive backend completed both runs with zero request errors.
+- ShareGPT-style serving validation (`vllm bench serve`, first 50 prompts,
+  output length 128) reproduced the same capacity behavior: baseline completed
+  c=3, partially failed at c=12, and fully failed at c=16; adaptive completed
+  c=3/c=12/c=16 with zero request errors.
 - Correctness tests for the exact helper paths passed on OpenShift:
   `42 passed, 1 xfailed`. The xfail documents the experimental Triton backend;
   it is intentionally not part of the exact serving path.
@@ -34,11 +39,17 @@ Honest claim:
 Non-claims:
 
 - It is not a general throughput speedup.
+- It is not a lower-latency/per-token speedup when both baseline and adaptive
+  fit. It can still be a useful aggregate throughput increase at pressure points
+  where baseline returns errors or dies and adaptive continues serving requests.
 - It does not increase vLLM's startup KV-cache allocation at the tested default
   settings.
 - It does not make the experimental Triton fused backend PR-ready.
 - It does not address the separate logprobs-on bug class discussed during the
   investigation.
+- It does not characterize tensor-parallel (`TP>1`) behavior. All reported
+  OpenShift results here are single-GPU/TP=1; row-chunking could introduce
+  different communication overheads in multi-GPU tensor-parallel deployments.
 
 ## Why DiffusionGemma sampler memory is special
 
@@ -65,6 +76,10 @@ multiple `[sampler_rows, vocab]` tensors live around the same step.
 
 - `c=3`, `c8`, `c12`, `c16`: client concurrency/fanout in the serving benchmark.
   For example, `c12` means the harness keeps up to 12 HTTP requests in flight.
+- Throughput in failed runs is tricky: `request_throughput` and total token/s can
+  be inflated by fast failures or prompt-token accounting. For capacity claims,
+  prioritize completed requests, non-empty errors, output token/s from successful
+  requests, and server OOM evidence.
 - In the **row-chunk focused c=3 rerun**, each variant ran three timed rounds at
   client concurrency 3. Each round submitted 12 total requests. The table reports
   mean/min/max across those three rounds.
@@ -125,12 +140,12 @@ normal serving path. That makes it unsuitable as the default.
 
 OpenShift/A100 row-chunk focused c=3 rerun:
 
-| variant | mean tok/s | min tok/s | max tok/s | mean p50 s | mean p95 s | ready MiB | max bench MiB | errors |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| baseline | 224.70 | 196.33 | 245.35 | 1.07 | 1.57 | 77293 | 77295 | 0 |
-| rowchunk_128 | 138.78 | 135.39 | 141.81 | 1.70 | 2.63 | 77293 | 77295 | 0 |
-| rowchunk_256 | 152.50 | 148.25 | 155.75 | 1.68 | 2.15 | 77293 | 77807 | 0 |
-| rowchunk_512 | 154.44 | 146.28 | 164.63 | 1.61 | 2.16 | 77293 | 80367 | 0 |
+| variant      | mean tok/s | min tok/s | max tok/s | mean p50 s | mean p95 s | ready MiB | max bench MiB | errors |
+| ------------ | ---------: | --------: | --------: | ---------: | ---------: | --------: | ------------: | -----: |
+| baseline     |     224.70 |    196.33 |    245.35 |       1.07 |       1.57 |     77293 |         77295 |      0 |
+| rowchunk_128 |     138.78 |    135.39 |    141.81 |       1.70 |       2.63 |     77293 |         77295 |      0 |
+| rowchunk_256 |     152.50 |    148.25 |    155.75 |       1.68 |       2.15 |     77293 |         77807 |      0 |
+| rowchunk_512 |     154.44 |    146.28 |    164.63 |       1.61 |       2.16 |     77293 |         80367 |      0 |
 
 Conclusion: row-chunking is valuable only as a fallback when the fast path cannot
 fit.
@@ -173,10 +188,10 @@ VLLM_DIFFUSION_GEMMA_STREAMED_ROW_CHUNK=128
 
 Preliminary pressure probe with the same high-pressure serving shape, before selecting the final `row_chunk=128` fallback:
 
-| variant | c8 | c12 | c16 | max sampler rows | result |
-|---|---:|---:|---:|---:|---|
-| baseline | 102.6 tok/s, 0 errors | OOM / 24 errors | OOM / 32 errors | 3072 observed | fails under pressure |
-| rowchunk_256 | 110.7 tok/s, 0 errors | 238.7 tok/s, 0 errors | 216.1 tok/s, 0 errors | 3072 observed | survives |
+| variant      |                    c8 |                   c12 |                   c16 | max sampler rows | result               |
+| ------------ | --------------------: | --------------------: | --------------------: | ---------------: | -------------------- |
+| baseline     | 102.6 tok/s, 0 errors |       OOM / 24 errors |       OOM / 32 errors |    3072 observed | fails under pressure |
+| rowchunk_256 | 110.7 tok/s, 0 errors | 238.7 tok/s, 0 errors | 216.1 tok/s, 0 errors |    3072 observed | survives             |
 
 After selecting row chunk 128 for the `auto` fallback:
 
@@ -185,10 +200,10 @@ but 384/512 were unsafe under the high-pressure discriminator and 128 provided
 the best verified OOM margin among the safe fallback choices. The goal of this
 fallback is survival, not peak throughput.
 
-| run | tok/s | errors | mem max |
-|---|---:|---:|---:|
-| auto c12 | 194.9 | 0 | 80751 MiB |
-| auto c16 | 238.8 | 0 | 80751 MiB |
+| run      | tok/s | errors |   mem max |
+| -------- | ----: | -----: | --------: |
+| auto c12 | 194.9 |      0 | 80751 MiB |
+| auto c16 | 238.8 |      0 | 80751 MiB |
 
 The server log confirmed the intended adaptive switch:
 
@@ -210,6 +225,86 @@ Interpretation:
   portion of the run before OOM/server failure. The auto numbers are successful
   c12/c16 runs at the memory ceiling, so the coarse polled MiB values are not
   directly comparable as allocator deltas.
+
+## ShareGPT first-50 A/B validation
+
+To check that the pressure result was not only an artificial smoke prompt, we
+also ran a standard vLLM benchmark shape on OpenShift using `vllm bench serve`
+with a ShareGPT slice.
+
+Configuration:
+
+```text
+dataset: ShareGPT first 50 prompts from a first-500 valid-record slice
+backend: openai-chat
+endpoint: /v1/chat/completions
+sharegpt-output-len: 128
+request-rate: inf
+seed: 123
+server: google/diffusiongemma-26B-A4B-it
+server flags: --dtype bfloat16 --gpu-memory-utilization 0.90 --max-model-len 8192
+              --max-num-seqs 16 --max-num-batched-tokens 4096 --trust-remote-code
+```
+
+Result artifact:
+
+```text
+.omx/artifacts/diffusion-gemma-sampler-evolve/sharegpt-ab-20260616T194105Z/
+```
+
+Results:
+
+| variant | c | completed | non-empty errors | output tok/s | req/s | total tok/s | p95 TTFT ms | server max MiB | failure evidence |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| baseline | 3 | 50/50 | 0 | 183.89 | 1.58 | 466.49 | 3373 | 80991 | none in this fanout |
+| baseline | 12 | 12/50 | 38 | 0.00 | 16.68 | 1736.00 | n/a | 80991 | 500s / CUDA OOM evidence |
+| baseline | 16 | 0/50 | 50 | 0.00 | 0.00 | 0.00 | n/a | 80991 | engine dead / connection errors |
+| adaptive | 3 | 50/50 | 0 | 175.21 | 1.51 | 444.75 | 3750 | 80751 | none |
+| adaptive | 12 | 50/50 | 0 | 152.68 | 1.31 | 386.62 | 12114 | 80751 | none |
+| adaptive | 16 | 50/50 | 0 | 160.70 | 1.38 | 407.31 | 15809 | 80751 | none |
+
+Interpretation:
+
+- The adaptive backend reproduced the high-pressure capacity result on a
+  ShareGPT-style workload: baseline completed the low-pressure c=3 run,
+  partially failed at c=12, and fully failed at c=16; adaptive completed all
+  three fanouts with zero request errors.
+- Baseline c=12 should be treated as a failed run, not a throughput datapoint:
+  only 12 of 50 requests completed, 38 returned `Internal Server Error`, and
+  reported output token/s was 0. The high `total tok/s` value is not a useful
+  serving capacity metric because it includes fast failed/prompt-token
+  accounting; the `0.00` output token/s is also a benchmark artifact of the
+  heavily errored run, so the reliable conclusion is failure, not speed.
+- Adaptive c=12/c=16 aggregate output token/s is lower than baseline c=3, but
+  that is still usable output throughput under a fanout where baseline is not
+  producing reliable output and/or the engine dies.
+- Adaptive survival at c=12/c=16 comes with much higher p95 TTFT
+  (~12.1-15.8s versus ~3.4-3.8s at c=3). This is an OOM-survival/capacity
+  result, not proof of good interactive latency under high load.
+- At c=3, adaptive was about 5% lower in output token/s in this single run
+  (175.21 vs 183.89). Because the `auto` policy should remain on the
+  materialized path below the row threshold, this difference is likely Python
+  branching overhead, decode-batch logging overhead, or standard runtime
+  variance. A repeated low-pressure run without decode-batch logging is required
+  to prove that definitively. Disable
+  `VLLM_DIFFUSION_GEMMA_LOG_DECODE_BATCH=1` for clean performance runs.
+- This benchmark used output length 128. That is intentionally modest; the fact
+  that baseline still fails at c=12/c=16 is a strong pressure signal. Longer
+  ShareGPT soaks are still recommended before upstream PR claims.
+- The ShareGPT data above is one run per fanout; it is strong enough for a local
+  capacity discriminator, but repeated runs are needed before treating the exact
+  throughput/latency values as stable.
+
+The adaptive server log confirmed the intended switch:
+
+```text
+DiffusionGemma streamed sampler path is active
+backend=auto
+effective_backend=row_chunked
+sampler_rows=3072
+auto_max_materialized_rows=2048
+row_chunk=128
+```
 
 ## Correctness and regression coverage
 
@@ -243,6 +338,15 @@ The tests cover:
 - row-chunked sample/entropy/soft-embedding equivalence against the exact
   materialized cuBLAS/PyTorch path;
 - the intentional xfail for the experimental Triton backend exactness gap.
+
+Important PR-readiness gap: these tests cover the helper math and backend
+selection, but they are not a full model-execution integration test of
+`_compiled_sample_step_from_streamed` through vLLM's generation state machine.
+Before an upstream PR, add or parameterize an end-to-end DiffusionGemma
+generation test that sets `VLLM_DIFFUSION_GEMMA_STREAMED_SAMPLER=1` and
+`VLLM_DIFFUSION_GEMMA_STREAMED_BACKEND=auto`, then verifies the streamed sampler
+integrates correctly with canvas history, sampler output state, and normal
+request completion.
 
 ## Current knobs for future work
 
@@ -284,6 +388,7 @@ Supporting artifacts:
 .omx/artifacts/diffusion-gemma-sampler-evolve/20260616T-rowchunk-focused-rerun/
 .omx/artifacts/diffusion-gemma-sampler-evolve/maxbatched4096-probe-20260616T162937Z/
 .omx/artifacts/diffusion-gemma-sampler-evolve/auto-pressure128-20260616T175855Z/
+.omx/artifacts/diffusion-gemma-sampler-evolve/sharegpt-ab-20260616T194105Z/
 .omx/artifacts/diffusion-gemma-sampler-evolve/DRAW5_CONCEPT_BLEND_SOFTEMBED_PLAN.md
 ```
 
@@ -294,6 +399,8 @@ File-council review artifacts:
 .omx/artifacts/diffusion-gemma-sampler-evolve/20260616T-file-council-after-auto-backend-compact/
 .omx/artifacts/diffusion-gemma-sampler-evolve/20260616T-file-council-auto-chunk128/
 .omx/artifacts/diffusion-gemma-sampler-evolve/20260616T-file-council-after-auto128-final/
+.omx/artifacts/diffusion-gemma-sampler-evolve/file-council-sharegpt-report-20260616T195652Z/
+.omx/artifacts/diffusion-gemma-sampler-evolve/file-council-sharegpt-report-final-20260616T200151Z/
 ```
 
 ## Handoff: how to continue from this branch
@@ -374,7 +481,7 @@ python "$FILE_COUNCIL_SKILL_DIR/scripts/run_file_council.py" \
   --file /absolute/path/to/vllm/model_executor/models/diffusion_gemma_fused_lse.py \
   --file /absolute/path/to/tests/model_executor/test_diffusion_gemma_fused_lse.py \
   --targets chatgpt claude gemini gemini-flash \
-  --thinking medium \
+  --thinking high \
   --no-web-search
 ```
 
@@ -573,6 +680,24 @@ max_tokens: 128 in the pressure runs
 metrics: successful completion tokens / wall seconds, request errors, p50 when captured, and coarse GPU memory polling
 ```
 
+ShareGPT harness shape used for the normal dataset validation:
+
+```bash
+python3 -m vllm.entrypoints.cli.main bench serve \
+  --backend openai-chat \
+  --endpoint /v1/chat/completions \
+  --dataset-name sharegpt \
+  --dataset-path /tmp/sharegpt-bench/sharegpt_first500.json \
+  --disable-shuffle \
+  --num-prompts 50 \
+  --sharegpt-output-len 128 \
+  --request-rate inf \
+  --max-concurrency <3|12|16> \
+  --seed 123 \
+  --save-result \
+  --save-detailed
+```
+
 The final pressure run artifacts are the source of truth for exact fields:
 
 ```text
@@ -616,7 +741,12 @@ The testing pyramid that worked best:
    - raise `max_num_batched_tokens` / `max_num_seqs` and compare c8/c12/c16;
    - success criterion is not speedup; it is baseline OOM vs adaptive zero
      errors at the same shape.
-6. **Review gates**
+6. **ShareGPT-style serving validation**
+   - run `vllm bench serve --dataset-name sharegpt` against both variants;
+   - count non-empty errors, not just process return code;
+   - interpret failed baseline fanouts as capacity failures, not comparable
+     throughput datapoints.
+7. **Review gates**
    - file-council before/after significant pivots;
    - explicitly separate evidence from inference and document non-claims.
 
@@ -697,12 +827,19 @@ Recommended next work, in order:
 1. **Longer soak of the current adaptive baseline**
    - same high-pressure shape;
    - more prompts and longer wall time;
+   - include a repeated ShareGPT run at c12/c16 with 100-200 prompts;
+   - optionally increase output length after the first longer soak. The current
+     output length 128 is enough to demonstrate that baseline fails under this
+     concurrency shape, but longer generations would better characterize latency
+     and stability.
    - confirm zero errors and stable memory near c12/c16.
 2. **Broader shape sweep**
    - `gpu_memory_utilization` variants;
    - `max_num_batched_tokens` variants;
    - `max_num_seqs` variants;
    - possibly smaller GPUs if available.
+   - identify the highest adaptive concurrency / batch shape that still produces
+     stable output, and report it separately from per-token speed.
 3. **CI-runnable unit cleanup**
    - make sure exact helper tests can run in upstream vLLM CI without the custom
      OpenShift overlay when possible.
@@ -721,7 +858,12 @@ Before any upstream PR, add a PR-readiness checklist pass:
 - run the relevant vLLM lint/test subset in an upstream-compatible environment;
 - confirm env-var naming and feature gating are acceptable;
 - remove or move private OpenShift/tooling handoff details out of PR-facing docs;
+  this report is intentionally useful as a local handoff, but should not be
+  copied into an upstream PR as-is because it contains workstation-specific
+  paths, OpenShift operational details, and local skill-process history.
 - search open vLLM PRs/issues for duplicate DiffusionGemma sampler memory work;
+- add at least one end-to-end generation integration test for the opt-in
+  streamed `auto` path, not only helper-level numerical tests;
 - write the PR as an opt-in OOM mitigation with test evidence and AI-assistance
   disclosure, not as a general speedup.
 
