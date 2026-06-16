@@ -445,6 +445,9 @@ class Worker(WorkerBase):
         self.non_torch_memory = profile_result.non_torch_increase
         self.peak_activation_memory = profile_result.torch_peak_increase
         self.cudagraph_memory_estimate = cudagraph_memory_estimate
+        self.extra_non_kv_cache_memory = (
+            self.model_runner.get_extra_non_kv_cache_memory_bytes()
+        )
 
         free_gpu_memory = profile_result.after_profile.free_memory
         # NOTE(woosuk): Here we assume that the other processes using the same
@@ -462,6 +465,7 @@ class Worker(WorkerBase):
             self.requested_memory
             - profile_result.non_kv_cache_memory
             - cudagraph_memory_estimate_applied
+            - self.extra_non_kv_cache_memory
         )
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
@@ -477,6 +481,22 @@ class Worker(WorkerBase):
             format_gib(free_gpu_memory - unrequested_memory),
         )
         logger.debug(profile_result)
+        if self.extra_non_kv_cache_memory > 0:
+            logger.info_once(
+                "Reserving %s GiB for model-reported non-KV runtime memory "
+                "outside the startup profile.",
+                format_gib(self.extra_non_kv_cache_memory),
+            )
+            if self.available_kv_cache_memory_bytes <= 0:
+                raise ValueError(
+                    "Model-reported non-KV runtime memory reserve leaves no "
+                    "available KV cache memory. Reduce the model-specific "
+                    "reserve, lower --gpu-memory-utilization, or reduce "
+                    "--max-model-len/--max-num-seqs. Reserve: "
+                    f"{format_gib(self.extra_non_kv_cache_memory)} GiB; "
+                    "available KV cache memory after reserve: "
+                    f"{format_gib(self.available_kv_cache_memory_bytes)} GiB."
+                )
         logger.info_once(
             "Available KV cache memory: %s GiB",
             format_gib(self.available_kv_cache_memory_bytes),

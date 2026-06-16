@@ -1,35 +1,60 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
+import numpy as np
 import pytest
 import torch
 
+from vllm.model_executor.models import diffusion_gemma
 from vllm.model_executor.models.diffusion_gemma import (
+    DiffusionGemmaRequestStates,
+    DiffusionSampler,
     _get_diffusion_gemma_streamed_backend,
     _resolve_diffusion_gemma_streamed_backend_for_rows,
 )
 from vllm.model_executor.models.diffusion_gemma_fused_lse import (
     _stable_uniform_from_indices,
-    diffusion_gemma_softcap_cublas_two_pass_sample_soft_embeds,
     diffusion_gemma_merge_gumbel_shard_states,
     diffusion_gemma_merge_softcap_shard_states,
+    diffusion_gemma_softcap_cublas_two_pass_sample_soft_embeds,
     diffusion_gemma_softcap_gumbel_sample,
     diffusion_gemma_softcap_gumbel_shard_state,
     diffusion_gemma_softcap_lse,
-    diffusion_gemma_softcap_online_soft_embeds,
-    diffusion_gemma_softcap_online_sample_soft_embeds,
-    diffusion_gemma_softcap_row_chunked_sample_soft_embeds,
     diffusion_gemma_softcap_lse_entropy_argmax,
+    diffusion_gemma_softcap_online_sample_soft_embeds,
+    diffusion_gemma_softcap_online_soft_embeds,
+    diffusion_gemma_softcap_reductions_soft_embeds,
+    diffusion_gemma_softcap_row_chunked_sample_soft_embeds,
+    diffusion_gemma_softcap_shard_state,
     diffusion_gemma_softcap_triton_sample_soft_embeds,
     diffusion_gemma_softcap_triton_single_pass_sample_soft_embeds,
-    diffusion_gemma_softcap_reductions_soft_embeds,
-    diffusion_gemma_softcap_shard_state,
 )
-
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required for Triton LSE tests"
 )
+
+
+class _FakeSamplingStates:
+
+    def __init__(self, max_num_logprobs: int = -1):
+        self._max_num_logprobs = max_num_logprobs
+
+    def max_num_logprobs(self, _slots):
+        return self._max_num_logprobs
+
+
+class _FakeUvaBackedTensor:
+
+    def __init__(self, size: int, dtype: torch.dtype):
+        np_dtype = np.int64 if dtype is torch.int64 else np.int32
+        self.np = np.zeros((size,), dtype=np_dtype)
+        self.gpu = torch.zeros((size,), dtype=dtype, device="cuda")
+
+    def copy_to_uva(self):
+        self.gpu.copy_(torch.as_tensor(self.np, device="cuda"))
 
 
 def test_diffusion_gemma_streamed_backend_validation(monkeypatch):
@@ -89,6 +114,131 @@ def test_diffusion_gemma_streamed_auto_backend_boundary(monkeypatch):
         _resolve_diffusion_gemma_streamed_backend_for_rows("auto", 3073)
         == "row_chunked"
     )
+
+
+def test_diffusion_gemma_sampler_uses_streamed_auto_row_chunked_path(
+    monkeypatch,
+):
+    monkeypatch.setenv("VLLM_DIFFUSION_GEMMA_STREAMED_BACKEND", "auto")
+    monkeypatch.setenv(
+        "VLLM_DIFFUSION_GEMMA_STREAMED_AUTO_MAX_MATERIALIZED_ROWS", "3"
+    )
+    monkeypatch.delenv("VLLM_DIFFUSION_GEMMA_STREAMED_ROW_CHUNK", raising=False)
+    monkeypatch.setattr(diffusion_gemma, "UvaBackedTensor", _FakeUvaBackedTensor)
+    monkeypatch.setattr(
+        diffusion_gemma,
+        "async_copy_to_gpu",
+        lambda x, device=None, out=None: torch.as_tensor(x, device=device),
+    )
+    monkeypatch.setattr(
+        diffusion_gemma,
+        "_compute_num_rejected",
+        lambda num_logits, num_sampled, query_start_loc: num_logits - num_sampled,
+    )
+
+    calls: list[dict[str, object]] = []
+
+    def fake_row_chunked(
+        hidden,
+        lm_head_weight,
+        embed_weight,
+        softcap,
+        temperature,
+        seed,
+        *,
+        row_chunk_size,
+        row_seed_offsets,
+    ):
+        calls.append(
+            {
+                "hidden_shape": tuple(hidden.shape),
+                "row_chunk_size": row_chunk_size,
+                "row_seed_offsets": row_seed_offsets.detach().cpu().tolist(),
+                "seed": seed,
+            }
+        )
+        rows = hidden.shape[0]
+        device = hidden.device
+        new_tokens = torch.arange(rows, device=device, dtype=torch.long) % 7
+        entropy = torch.zeros(rows, device=device, dtype=torch.float32)
+        soft_embeds = torch.ones(
+            rows, embed_weight.shape[1], device=device, dtype=torch.float32
+        )
+        return (
+            torch.zeros(rows, device=device, dtype=torch.float32),
+            entropy,
+            new_tokens,
+            new_tokens.clone(),
+            soft_embeds,
+        )
+
+    monkeypatch.setattr(
+        diffusion_gemma,
+        "diffusion_gemma_softcap_row_chunked_sample_soft_embeds",
+        fake_row_chunked,
+    )
+
+    states = DiffusionGemmaRequestStates(
+        max_num_reqs=2,
+        canvas_length=2,
+        vocab_size=7,
+        max_denoising_steps=4,
+        device=torch.device("cuda"),
+        hidden_size=3,
+        stability_threshold=2,
+    )
+    sampler = SimpleNamespace(
+        sampling_states=_FakeSamplingStates(max_num_logprobs=-1),
+        req_states=SimpleNamespace(
+            draft_tokens=torch.zeros(2, 2, dtype=torch.long, device="cuda")
+        ),
+    )
+    diffusion_sampler = DiffusionSampler(
+        sampler=sampler,
+        diffusion_config=SimpleNamespace(canvas_length=2),
+        vocab_size=7,
+        diffusion_states=states,
+        confidence_threshold=1.0,
+        t_min=1.0,
+        t_max=1.0,
+        entropy_bound=10.0,
+        embed_weight=torch.randn(7, 3, device="cuda", dtype=torch.bfloat16),
+        lm_head_weight=torch.randn(7, 3, device="cuda", dtype=torch.bfloat16),
+        final_logit_softcapping=30.0,
+        normalizer=torch.tensor(1.0, device="cuda"),
+        use_streamed_sampler=True,
+    )
+    input_batch = SimpleNamespace(
+        num_reqs=2,
+        num_draft_tokens=1,
+        idx_mapping_np=np.array([0, 1], dtype=np.int64),
+        idx_mapping=torch.tensor([0, 1], dtype=torch.long, device="cuda"),
+        cu_num_logits_np=np.array([0, 2, 4], dtype=np.int64),
+        query_start_loc_np=np.array([0, 2, 4], dtype=np.int64),
+        query_start_loc=torch.tensor([0, 2, 4], dtype=torch.long, device="cuda"),
+    )
+
+    output = diffusion_sampler(
+        torch.randn(4, 3, device="cuda", dtype=torch.bfloat16),
+        input_batch,
+    )
+
+    assert output.logprobs_tensors is None
+    assert calls == [
+        {
+            "hidden_shape": (4, 3),
+            "row_chunk_size": 256,
+            "row_seed_offsets": [0, 1, 2, 3],
+            "seed": 0,
+        }
+    ]
+    torch.testing.assert_close(
+        states.canvas[:2],
+        torch.tensor([[0, 1], [2, 3]], device="cuda", dtype=torch.long),
+        rtol=0,
+        atol=0,
+    )
+    assert diffusion_sampler._stream_seed == 1
 
 
 def _reference_softcap_reductions(

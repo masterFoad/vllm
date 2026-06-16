@@ -27,6 +27,7 @@ from torch import nn
 from torch.nn import functional as F
 from transformers import AutoModel
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
@@ -74,6 +75,13 @@ logger = init_logger(__name__)
 # efficient matmuls.
 _DIFFUSION_GEMMA_SC_CHUNK_SIZE = 16384
 
+_DIFFUSION_GEMMA_SAMPLER_RESERVE_ENV = (
+    "VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_MIB"
+)
+_DIFFUSION_GEMMA_SAMPLER_RESERVE_SCALE_ENV = (
+    "VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_SCALE"
+)
+
 _DIFFUSION_GEMMA_EXACT_STREAMED_BACKENDS = {
     "auto",
     "eager",
@@ -115,6 +123,41 @@ def _get_diffusion_gemma_streamed_backend() -> str:
             "research benchmarks."
         )
     return backend
+
+
+def _get_diffusion_gemma_sampler_memory_reserve_bytes(
+    reserve_spec: str,
+    reserve_scale: float,
+    *,
+    max_num_seqs: int,
+    max_num_batched_tokens: int,
+    canvas_length: int,
+    vocab_size: int,
+) -> int:
+    """Estimate extra KV-sizing reserve for DiffusionGemma sampler scratch."""
+    reserve_spec = reserve_spec.strip()
+    if not reserve_spec or reserve_spec == "0":
+        return 0
+
+    if reserve_spec.lower() != "auto":
+        reserve_mib = int(reserve_spec)
+        if reserve_mib < 0:
+            raise ValueError(
+                f"{_DIFFUSION_GEMMA_SAMPLER_RESERVE_ENV} must be >= 0 or 'auto'"
+            )
+        return reserve_mib * (1 << 20)
+
+    if reserve_scale < 0:
+        raise ValueError(
+            f"{_DIFFUSION_GEMMA_SAMPLER_RESERVE_SCALE_ENV} must be >= 0"
+        )
+
+    max_decode_reqs = min(
+        int(max_num_seqs),
+        max(1, int(max_num_batched_tokens) // int(canvas_length)),
+    )
+    sampler_rows = max_decode_reqs * int(canvas_length)
+    return int(sampler_rows * int(vocab_size) * torch.float32.itemsize * reserve_scale)
 
 
 def _resolve_diffusion_gemma_streamed_backend_for_rows(
@@ -1074,6 +1117,29 @@ class DiffusionGemmaModelState(ModelState):
     def get_supported_generation_tasks(self):
         return ("generate",)
 
+    def get_extra_non_kv_cache_memory_bytes(self) -> int:
+        reserve = _get_diffusion_gemma_sampler_memory_reserve_bytes(
+            envs.VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_MIB,
+            envs.VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_SCALE,
+            max_num_seqs=self.max_num_reqs,
+            max_num_batched_tokens=self.max_num_tokens,
+            canvas_length=self.diffusion_states.canvas_length,
+            # Use the rank-local lm_head rows instead of global vocab size so
+            # TP ranks do not automatically reserve full-vocab memory each.
+            vocab_size=self.model.lm_head.weight.shape[0],
+        )
+        if reserve > 0:
+            logger.info_once(
+                "DiffusionGemma sampler memory reserve: %s GiB "
+                "(%s=%s, %s=%s)",
+                reserve / (1 << 30),
+                _DIFFUSION_GEMMA_SAMPLER_RESERVE_ENV,
+                envs.VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_MIB,
+                _DIFFUSION_GEMMA_SAMPLER_RESERVE_SCALE_ENV,
+                envs.VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_SCALE,
+            )
+        return reserve
+
     def custom_sampler(self, sampler: Any) -> tuple[Any, Any] | None:
         diffusion_config = self.vllm_config.diffusion_config
         gen = self.gen_config
@@ -1550,7 +1616,9 @@ class DiffusionSampler:
 
         slots_np = input_batch.idx_mapping_np[:num_reqs]
         max_num_logprobs = self.sampling_states.max_num_logprobs(slots_np)
-        streamed_hidden = self.use_streamed_sampler and logits.shape[-1] != self.vocab_size
+        streamed_hidden = (
+            self.use_streamed_sampler and logits.shape[-1] != self.vocab_size
+        )
         streamed_backend = self._streamed_backend
         sampler_rows = num_decode * CL
         # Materialized cuBLAS/PyTorch logits are much faster at the proven safe
@@ -1569,7 +1637,11 @@ class DiffusionSampler:
             and effective_streamed_backend != "materialized"
         ):
             streamed_backend = effective_streamed_backend
-            row_chunk_default = "128" if self._streamed_backend == "auto" else "256"
+            # OpenShift/A100 ShareGPT pressure sweeps found 256 to be the best
+            # safe auto fallback frontier for c12/c16: lower TTFT and higher
+            # output throughput than 128, while 384/512 OOMed in the row-chunked
+            # RNG path.  Keep explicit row_chunked at 256 as before.
+            row_chunk_default = "256"
             row_chunk_env = os.environ.get(
                 "VLLM_DIFFUSION_GEMMA_STREAMED_ROW_CHUNK", row_chunk_default
             )

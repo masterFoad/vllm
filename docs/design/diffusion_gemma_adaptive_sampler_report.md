@@ -25,16 +25,47 @@ The headline evidence from OpenShift/A100 testing:
   output length 128) reproduced the same capacity behavior: baseline completed
   c=3, partially failed at c=12, and fully failed at c=16; adaptive completed
   c=3/c=12/c=16 with zero request errors.
-- Correctness tests for the exact helper paths passed on OpenShift:
-  `42 passed, 1 xfailed`. The xfail documents the experimental Triton backend;
+- Correctness tests for the exact helper and reserve paths passed on OpenShift after the model-reported hook refactor:
+  `50 passed, 1 xfailed`. The xfail documents the experimental Triton backend;
   it is intentionally not part of the exact serving path.
+- Autoresearch found a stronger operational/control result: lowering
+  `--gpu-memory-utilization` to `0.85` gives the baseline materialized sampler
+  enough reserve to survive the same c12/c16 pressure shape, and it is faster
+  than row-chunking. This means the best upstream direction is likely
+  **sampler-spike-aware memory reservation/profiling** plus row-chunking as an
+  emergency fallback, not row-chunking as the primary performance path.
+- The current local implementation validates that direction with a generic
+  model-reported non-KV reserve hook. At user `--gpu-memory-utilization 0.90`,
+  `VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_MIB=auto`, and reserve scale
+  `1.1`, c3/c12/c16 ShareGPT pressure runs completed with zero request errors
+  while row-chunking was disabled. The post-hook c16 rerun reached `288.71`
+  output tok/s / p95 TTFT `8.59s`, matching the manual util=0.85 materialized
+  control within benchmark noise.
 
 Honest claim:
 
 > The adaptive backend is an OOM/capacity mitigation for DiffusionGemma's
-> sampler. It preserves the fast materialized path below a row threshold and
-> falls back to exact row-chunking above that threshold. In the tested
-> high-pressure A100 configuration, it avoids OOMs where the baseline fails.
+> sampler. The strongest current path preserves the fast materialized sampler
+> and reserves explicit non-KV headroom for the runtime sampler/logits spike;
+> exact row-chunking remains an escape hatch when the fast path cannot fit.
+
+Updated strategic claim after the reserve probe:
+
+> vLLM's current DiffusionGemma memory profile appears to miss a runtime
+> sampler/logits spike. If operators leave enough headroom, the existing fast
+> materialized path is best. The product-quality fix should reserve or profile
+> that spike automatically, then use exact row-chunking only when the configured
+> shape still exceeds the safe materialized envelope. This is a capacity/OOM
+> mitigation, not evidence of a larger startup KV cache.
+
+Validated prototype claim after the reserve-auto run:
+
+> An explicit DiffusionGemma sampler reserve can reproduce the "manual lower
+> util" fix while preserving the fast materialized sampler path. In the tested
+> A100/TP=1 pressure shape, reserve-auto at user util 0.90 completed c16 with no
+> OOM and `288.71` output tok/s after the hook refactor (`296.06` in the earlier
+> prototype rerun), compared with row-chunk fallback's `168.43` output tok/s and
+> baseline util 0.90's failures.
 
 Non-claims:
 
@@ -50,6 +81,9 @@ Non-claims:
 - It does not characterize tensor-parallel (`TP>1`) behavior. All reported
   OpenShift results here are single-GPU/TP=1; row-chunking could introduce
   different communication overheads in multi-GPU tensor-parallel deployments.
+- The row-chunk fallback is not currently the fastest way to make c12/c16
+  succeed. In these artifacts, a lower-KV-reserve baseline at
+  `gpu_memory_utilization=0.85` is faster and lower-latency.
 
 ## Why DiffusionGemma sampler memory is special
 
@@ -105,7 +139,8 @@ Key behavior:
 - Added opt-in `auto` backend policy for the streamed sampler:
   - if `sampler_rows <= 2048`, resolve internally to the existing materialized exact path;
   - if `sampler_rows > 2048`, use exact row-chunked sampling;
-  - the fallback row chunk defaults to `128` for `auto`.
+  - the fallback row chunk now defaults to `256` for `auto` after the
+    autoresearch frontier sweep.
 - Added knobs:
   - `VLLM_DIFFUSION_GEMMA_STREAMED_SAMPLER`
   - `VLLM_DIFFUSION_GEMMA_STREAMED_AUTO_MAX_MATERIALIZED_ROWS`
@@ -126,7 +161,7 @@ Without `VLLM_DIFFUSION_GEMMA_STREAMED_SAMPLER=1`, the backend selector is not
 used. With the streamed sampler enabled but no backend override, the selector
 uses `eager`, not `auto`. The current `auto` policy is a static
 `sampler_rows` threshold; it does not query allocator headroom or predict OOM
-dynamically. The `2048` threshold and `128` fallback chunk were selected for the
+dynamically. The `2048` threshold and `256` fallback chunk were selected for the
 tested A100/OpenShift shape and should be retuned before treating them as
 universal defaults; code comments and PR text should keep that hardware-specific
 warning visible.
@@ -173,9 +208,11 @@ profiled activation peak that sizes KV cache.
 Conclusion: do not claim larger KV cache at default startup. The useful capacity
 claim is narrower: high-pressure runtime OOM survival.
 
-## Final high-pressure result
+## Earlier high-pressure result
 
-Configuration under test:
+Configuration under test at the time. The later autoresearch sweep supersedes
+the fallback chunk choice from `128` to `256`, but this earlier result remains
+useful as the first pressure proof:
 
 ```text
 VLLM_DIFFUSION_GEMMA_STREAMED_SAMPLER=1
@@ -186,19 +223,20 @@ VLLM_DIFFUSION_GEMMA_STREAMED_ROW_CHUNK=128
 --max-num-seqs 16
 ```
 
-Preliminary pressure probe with the same high-pressure serving shape, before selecting the final `row_chunk=128` fallback:
+Preliminary pressure probe with the same high-pressure serving shape, before
+the first conservative `row_chunk=128` fallback was selected:
 
 | variant      |                    c8 |                   c12 |                   c16 | max sampler rows | result               |
 | ------------ | --------------------: | --------------------: | --------------------: | ---------------: | -------------------- |
 | baseline     | 102.6 tok/s, 0 errors |       OOM / 24 errors |       OOM / 32 errors |    3072 observed | fails under pressure |
 | rowchunk_256 | 110.7 tok/s, 0 errors | 238.7 tok/s, 0 errors | 216.1 tok/s, 0 errors |    3072 observed | survives             |
 
-After selecting row chunk 128 for the `auto` fallback:
+After selecting row chunk 128 for the initial `auto` fallback:
 
-Why `row_chunk=128`: larger chunks had higher normal-path throughput in some runs,
-but 384/512 were unsafe under the high-pressure discriminator and 128 provided
-the best verified OOM margin among the safe fallback choices. The goal of this
-fallback is survival, not peak throughput.
+Why `row_chunk=128` initially: larger chunks had higher normal-path throughput
+in some runs, but 384/512 were unsafe under the high-pressure discriminator and
+128 provided the best verified OOM margin at that point. Later autoresearch
+showed 256 is a better A100/TP=1 default while 384/512 remain unsafe.
 
 | run      | tok/s | errors |   mem max |
 | -------- | ----: | -----: | --------: |
@@ -306,19 +344,226 @@ auto_max_materialized_rows=2048
 row_chunk=128
 ```
 
+## Autoresearch update: clean c3, row-chunk frontier, and controls
+
+Artifact:
+
+```text
+.omx/artifacts/diffusion-gemma-sampler-evolve/autoresearch-20260616T2012Z/
+```
+
+Key OpenShift/A100 findings from the autoresearch run:
+
+1. **The low-pressure c=3 regression disappeared with logging off.**
+   - Baseline c=3 mean output tok/s across three repeats: `198.71`.
+   - Adaptive c=3 mean output tok/s across three repeats: `199.44`.
+   - Both had zero request errors.
+   - This supports the earlier suspicion that the single-run ~5% delta was
+     diagnostics/variance rather than a real low-pressure regression.
+
+2. **The row-chunk frontier moved from 128 to 256/320.**
+
+   ShareGPT, 100 prompts, output length 128, `--max-num-seqs 16`,
+   `--max-num-batched-tokens 4096`, request rate `inf`:
+
+   | adaptive fallback | c12 result | c16 result | notes |
+   |---|---:|---:|---|
+   | row_chunk 128 | 100/100, 148.18 output tok/s, p95 TTFT 12.67s | 100/100, 160.25 output tok/s, p95 TTFT 15.90s | safe but conservative |
+   | row_chunk 192 | 100/100, 148.94 output tok/s, p95 TTFT 13.39s | 100/100, 162.02 output tok/s, p95 TTFT 15.59s | safe, not better than 256 |
+   | row_chunk 256 | 100/100, 159.07 output tok/s, p95 TTFT 12.38s | 100/100, 168.43 output tok/s, p95 TTFT 15.46s | best balanced safe candidate |
+   | row_chunk 320 | 100/100, 151.52 output tok/s, p95 TTFT 12.75s | 100/100, 168.80 output tok/s, p95 TTFT 14.98s | c16 TTFT best, c12 weaker |
+   | row_chunk 384 | 48/100, 52 errors | 0/100, 100 errors | OOM in row-chunked RNG path |
+   | row_chunk 512 | 12/100, 88 errors | 0/100, 100 errors | OOM in row-chunked RNG path |
+
+   Local default was updated to `row_chunk=256` for `auto`: it improved output
+   tok/s and p95 TTFT versus 128 while preserving the zero-error c12/c16 result
+   in this A100/TP=1 shape. The 384/512 failures show why this is still a
+   conservative fallback and not a simple "larger is always better" knob.
+
+3. **The threshold cannot simply be raised to 3072.**
+   - `AUTO_MAX_MATERIALIZED_ROWS=3072` at c12 re-enters the materialized path and
+     reproduces baseline-like failure: 12/50 completed, 38 errors, CUDA OOM.
+   - This validates the current threshold side: c12's 3072 sampler rows must
+     chunk under this serving shape.
+
+4. **The strongest counterargument is real: capped baseline can be better.**
+   - Baseline with `--max-num-seqs 8` avoids OOM at c12/c16.
+   - At c16 it completed 100/100 with `264.69` output tok/s and p95 TTFT
+     `8.32s`, better than adaptive maxseq16 row-chunking.
+   - Therefore the current adaptive fallback is not yet a slam-dunk throughput
+     PR versus the operational alternative "lower max_num_seqs." Its best
+     framing is still runtime-spike containment while preserving configured
+     `max_num_seqs=16`, unless later work beats the capped-baseline control.
+
+5. **Finite request rate changes the TTFT story.**
+   - Adaptive row_chunk 256 at c16 with request rate `1.0` completed 100/100
+     with p95 TTFT `3.56s`.
+   - This confirms the file-council warning that `request-rate=inf` p95 TTFT is
+     heavily queue/saturation-influenced. Report both saturation and finite-rate
+     latency; do not attribute all high TTFT to sampler chunking.
+
+6. **OOM evidence is mixed but useful.**
+   - Baseline c16 OOM included a `4.00 GiB` fp32 compiled allocation, consistent
+     with a full `[rows, vocab]`-class transient.
+   - Baseline c12 and threshold-3072 failures sometimes OOM on smaller
+     follow-on allocations after memory is exhausted. Treat those as symptom
+     sites, not precise allocator attribution.
+   - row_chunk 384/512 OOM inside `_stable_uniform_from_indices`, proving the
+     row-chunked fallback itself has a chunk-size-dependent RNG scratch ceiling.
+
+## Autoresearch pivot: reserve/profiling beats row-chunking for throughput
+
+Artifact:
+
+```text
+.omx/artifacts/diffusion-gemma-sampler-evolve/autoresearch-20260616T2012Z/dg-util-reserve-20260616T213309Z/
+```
+
+The file-council asked for a "trivial alternative" control: instead of changing
+the sampler, leave the materialized baseline path in place and reserve more
+runtime headroom by lowering `--gpu-memory-utilization`. This matters because
+vLLM sizes KV cache from a startup profile; if the DiffusionGemma sampler spike
+is not represented in that profile, the server can allocate too much KV cache
+and then OOM later during high-concurrency decode.
+
+The result was decisive:
+
+| baseline util | c12 result | c16 result | interpretation |
+|---:|---:|---:|---|
+| 0.89 | 100/100, 257.41 tok/s, p95 TTFT 8.09s | 16/100, 84 errors | c12 survives, c16 still OOMs |
+| 0.88 | 100/100, 249.29 tok/s, p95 TTFT 8.56s | 16/100, 84 errors | c16 still OOMs |
+| 0.87 | 100/100, 253.21 tok/s, p95 TTFT 7.68s | 16/100, 84 errors | c16 still OOMs |
+| 0.85 | 100/100, 256.42 tok/s, p95 TTFT 7.79s | 100/100, 287.38 tok/s, p95 TTFT 8.25s | c12/c16 both survive |
+
+Contrast with the best verified adaptive row-chunk fallback at util 0.90 /
+maxseq16:
+
+| variant | c12 result | c16 result |
+|---|---:|---:|
+| adaptive row_chunk 256 | 100/100, 159.07 tok/s, p95 TTFT 12.38s | 100/100, 168.43 tok/s, p95 TTFT 15.46s |
+| baseline util 0.85 | 100/100, 256.42 tok/s, p95 TTFT 7.79s | 100/100, 287.38 tok/s, p95 TTFT 8.25s |
+
+This changes the recommended path. Row-chunking is still useful: it is exact,
+bounded, and it keeps the server alive when the configured materialized path
+would exceed the available slack. But as a primary solution it is dominated by
+keeping the fast materialized path and reserving enough memory for the sampler
+spike.
+
+Working hypothesis for the next implementation:
+
+1. DiffusionGemma has a runtime sampler/logits transient that is not captured by
+   the startup KV-cache profile.
+2. At util 0.90/maxseq16 this transient is profiler-blind enough to OOM at c16.
+3. Lowering util to 0.85 removes enough KV cache to create the required runtime
+   slack, so the faster materialized path succeeds.
+4. Therefore the PR-shaped fix is to make the runtime reserve explicit and
+   model-aware, rather than asking users to discover a lower util by trial and
+   error.
+
+Candidate product shape:
+
+- Add a model-specific DiffusionGemma sampler reserve estimate to the memory
+  profiling/KV-sizing path, or add an internal model hook that reports extra
+  non-KV runtime scratch needed by the sampler.
+- Keep `auto` row-chunking as an opt-in or last-resort fallback for shapes where
+  the estimated reserve is exceeded.
+- Validate against both controls:
+  1. baseline util 0.90 fails at c16;
+  2. baseline with automatic reserve at user util 0.90 behaves like manual util
+     0.85 while preserving the fast materialized sampler path.
+
+### Reserve-auto / model-reported hook result
+
+Artifact:
+
+```text
+.omx/artifacts/diffusion-gemma-sampler-evolve/autoresearch-20260616T2012Z/dg-reserve-auto-rerun2-20260616T222830Z/
+.omx/artifacts/diffusion-gemma-sampler-evolve/autoresearch-20260616T2012Z/dg-reserve-hook-rerun3-20260616T230128Z/
+```
+
+Implementation:
+
+- Added a generic model hook:
+  - `ModelState.get_extra_non_kv_cache_memory_bytes() -> int` defaults to `0`;
+  - `GPUModelRunner.get_extra_non_kv_cache_memory_bytes()` forwards the model
+    state value;
+  - `GPUWorker` subtracts that value from available KV-cache memory and logs it
+    as model-reported non-KV runtime memory outside the startup profile.
+- DiffusionGemma overrides the hook with opt-in reserve envs:
+  - `VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_MIB`
+    - unset or `0`: disabled;
+    - integer: explicit MiB reserve;
+    - `auto`: estimate one fp32 rank-local sampler/logits buffer from the
+      maximum decode rows implied by `max_num_seqs`, `max_num_batched_tokens`,
+      canvas length, and local `lm_head` vocab rows.
+  - `VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_SCALE`
+    - multiplier for the `auto` estimate.
+- The worker rejects configurations where the model-reported reserve leaves no
+  available KV-cache memory.
+- The OpenShift validation used `auto` with scale `1.1`, which reserved
+  `4.4 GiB`, produced `17.49 GiB` available KV memory / `126,124` KV tokens,
+  and kept row-chunking disabled.
+
+ShareGPT, 100 prompts, output length 128, user util 0.90,
+`--max-num-seqs 16`, `--max-num-batched-tokens 4096`:
+
+| variant | c | completed | errors | output tok/s | p95 TTFT | OOM count |
+|---|---:|---:|---:|---:|---:|---:|
+| reserve-auto scale 1.1, pre-hook prototype | 3 | 100/100 | 0 | 191.84 | 2.52s | 0 |
+| reserve-auto scale 1.1, pre-hook prototype | 12 | 100/100 | 0 | 287.66 | 6.48s | 0 |
+| reserve-auto scale 1.1, pre-hook prototype | 16 | 100/100 | 0 | 296.06 | 8.41s | 0 |
+| reserve-auto scale 1.1, model hook rerun | 3 | 100/100 | 0 | 134.33 | n/a | 0 |
+| reserve-auto scale 1.1, model hook rerun | 12 | 100/100 | 0 | 282.30 | 7.17s | 0 |
+| reserve-auto scale 1.1, model hook rerun | 16 | 100/100 | 0 | 288.71 | 8.59s | 0 |
+
+Comparison at c16:
+
+| variant | user util | c16 result |
+|---|---:|---:|
+| baseline materialized | 0.90 | 16/100 completed, 84 errors |
+| adaptive row_chunk 256 | 0.90 | 100/100, 168.43 tok/s, p95 TTFT 15.46s |
+| baseline materialized, manual lower util | 0.85 | 100/100, 287.38 tok/s, p95 TTFT 8.25s |
+| reserve-auto materialized, pre-hook prototype | 0.90 | 100/100, 296.06 tok/s, p95 TTFT 8.41s |
+| reserve-auto materialized, model hook rerun | 0.90 | 100/100, 288.71 tok/s, p95 TTFT 8.59s |
+
+This is the best result so far. It preserves the normal materialized sampler
+performance profile, prevents the runtime OOM, and avoids the row-chunk
+throughput penalty. It is an aggregate successful-throughput/capacity win at the
+pressure point because the baseline at util 0.90 returns errors, while the
+reserve path keeps serving all requests at the fast materialized rate. It is not
+a per-token speedup over another successful materialized run; the manual util
+0.85 control and reserve-auto are within benchmark noise.
+
+Important caveats:
+
+- The model-specific estimate now lives in DiffusionGemma model state and the
+  generic worker only sees model-reported bytes. File-council still flagged this
+  as prototype-quality until TP, scale, and long-context validation are done.
+- The reserve is paid as reduced KV cache for the server lifetime. That is a
+  good trade in the tested shape because the unreserved server OOMs, but it
+  must be exposed clearly in startup logs and tested for KV starvation.
+- `TP>1` is unvalidated. The current code uses rank-local `lm_head` vocab rows
+  to avoid obvious per-rank full-vocab over-reservation, but this is only correct
+  if the live sampler/logits spike is rank-sharded the same way. If any TP path
+  gathers full-vocab logits per rank, `auto` would under-reserve.
+- The `1.1` scale is empirical. The single-buffer estimate (`scale=1.0`) should
+  be tested separately before making any default claim; file-council also raised
+  the possibility that some shapes may need a larger live-factor.
+
 ## Correctness and regression coverage
 
 OpenShift/A100 targeted test command:
 
 ```text
 PYTHONPATH=/tmp/vllm-overlay pytest -q \
-  /tmp/vllm-overlay/tests/model_executor/test_diffusion_gemma_fused_lse.py
+  tests/v1/worker/test_diffusion_sampler_memory_reserve.py \
+  tests/model_executor/test_diffusion_gemma_fused_lse.py
 ```
 
 Observed result:
 
 ```text
-42 passed, 1 xfailed, 20 warnings
+50 passed, 1 xfailed, 20 warnings in 22.81s
 ```
 
 Fresh targeted rerun of the most relevant tests:
@@ -335,6 +580,9 @@ The tests cover:
 
 - backend environment parsing and validation;
 - the `auto` threshold boundary;
+- the `DiffusionSampler` integration path selecting `auto` row-chunk fallback
+  and the `row_chunk=256` default;
+- the DiffusionGemma sampler reserve estimate/override parser;
 - row-chunked sample/entropy/soft-embedding equivalence against the exact
   materialized cuBLAS/PyTorch path;
 - the intentional xfail for the experimental Triton backend exactness gap.
@@ -354,16 +602,27 @@ request completion.
 VLLM_DIFFUSION_GEMMA_STREAMED_SAMPLER=1
 VLLM_DIFFUSION_GEMMA_STREAMED_BACKEND=eager|auto|cublas_two_pass|row_chunked|triton_full
 VLLM_DIFFUSION_GEMMA_STREAMED_AUTO_MAX_MATERIALIZED_ROWS=2048
-VLLM_DIFFUSION_GEMMA_STREAMED_ROW_CHUNK=128
+VLLM_DIFFUSION_GEMMA_STREAMED_ROW_CHUNK=256
 VLLM_DIFFUSION_GEMMA_LOG_DECODE_BATCH=1
+VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_MIB=auto|<MiB>
+VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_SCALE=1.1
 ```
 
-Recommended local serving mode for continued capacity testing:
+Recommended local serving mode for continued reserve/capacity testing:
+
+```text
+VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_MIB=auto
+VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_SCALE=1.1
+```
+
+This keeps the fast materialized sampler path and sizes KV cache with explicit
+headroom for the sampler spike. Keep the streamed fallback available as the
+secondary safety path:
 
 ```text
 VLLM_DIFFUSION_GEMMA_STREAMED_SAMPLER=1
 VLLM_DIFFUSION_GEMMA_STREAMED_BACKEND=auto
-VLLM_DIFFUSION_GEMMA_STREAMED_ROW_CHUNK=128
+VLLM_DIFFUSION_GEMMA_STREAMED_ROW_CHUNK=256
 ```
 
 Recommended high-pressure discriminator:
@@ -389,6 +648,12 @@ Supporting artifacts:
 .omx/artifacts/diffusion-gemma-sampler-evolve/maxbatched4096-probe-20260616T162937Z/
 .omx/artifacts/diffusion-gemma-sampler-evolve/auto-pressure128-20260616T175855Z/
 .omx/artifacts/diffusion-gemma-sampler-evolve/sharegpt-ab-20260616T194105Z/
+.omx/artifacts/diffusion-gemma-sampler-evolve/autoresearch-20260616T2012Z/
+.omx/artifacts/diffusion-gemma-sampler-evolve/autoresearch-20260616T2012Z/dg-reserve-auto-rerun2-20260616T222830Z/
+.omx/artifacts/diffusion-gemma-sampler-evolve/autoresearch-20260616T2012Z/dg-reserve-hook-rerun3-20260616T230128Z/
+.omx/artifacts/diffusion-gemma-sampler-evolve/autoresearch-20260616T2012Z/latest-final-check-dir.txt
+.omx/artifacts/diffusion-gemma-sampler-evolve/autoresearch-20260616T2012Z/final-draw5-synthesis.md
+.omx/artifacts/diffusion-gemma-sampler-evolve/autoresearch-20260616T2012Z/final-concept-blending-reserve.md
 .omx/artifacts/diffusion-gemma-sampler-evolve/DRAW5_CONCEPT_BLEND_SOFTEMBED_PLAN.md
 ```
 
@@ -425,7 +690,10 @@ Main files to read first:
 docs/design/diffusion_gemma_adaptive_sampler_report.md
 vllm/model_executor/models/diffusion_gemma.py
 vllm/model_executor/models/diffusion_gemma_fused_lse.py
+vllm/v1/worker/gpu_worker.py
+vllm/v1/worker/gpu/model_states/interface.py
 tests/model_executor/test_diffusion_gemma_fused_lse.py
+tests/v1/worker/test_diffusion_sampler_memory_reserve.py
 ```
 
 Start by checking whether the branch is still based on current upstream.
@@ -488,6 +756,8 @@ python "$FILE_COUNCIL_SKILL_DIR/scripts/run_file_council.py" \
 Most useful local/private file-council artifacts from this investigation:
 
 ```text
+.omx/artifacts/diffusion-gemma-sampler-evolve/autoresearch-20260616T2012Z/final-file-council-compact-output.txt
+.omx/artifacts/diffusion-gemma-sampler-evolve/autoresearch-20260616T2012Z/latest-final-compact-file-council-session.txt
 .omx/artifacts/diffusion-gemma-sampler-evolve/20260616T-file-council-before-auto-backend-compact/
 .omx/artifacts/diffusion-gemma-sampler-evolve/20260616T-file-council-after-auto-backend-compact/
 .omx/artifacts/diffusion-gemma-sampler-evolve/20260616T-file-council-auto-chunk128/
@@ -657,7 +927,7 @@ For adaptive sampler experiments, add:
 export VLLM_DIFFUSION_GEMMA_STREAMED_SAMPLER=1
 export VLLM_DIFFUSION_GEMMA_STREAMED_BACKEND=auto
 export VLLM_DIFFUSION_GEMMA_STREAMED_AUTO_MAX_MATERIALIZED_ROWS=2048
-export VLLM_DIFFUSION_GEMMA_STREAMED_ROW_CHUNK=128
+export VLLM_DIFFUSION_GEMMA_STREAMED_ROW_CHUNK=256
 # Optional diagnostics:
 export VLLM_DIFFUSION_GEMMA_LOG_DECODE_BATCH=1
 ```
@@ -710,8 +980,8 @@ The final pressure run artifacts are the source of truth for exact fields:
 For a future rerun, save the server log, client JSON, pod description, and GPU
 memory poll for every variant. For OOM cases, preserve the CUDA OOM traceback or
 pod termination reason. With `VLLM_DIFFUSION_GEMMA_LOG_DECODE_BATCH=1`, verify
-that logs include `effective_backend=row_chunked`, `sampler_rows`, and
-`row_chunk=128` once the threshold is crossed.
+that logs include `effective_backend=row_chunked`, `sampler_rows`, and the
+expected `row_chunk` once the threshold is crossed.
 
 ### Testing strategy used
 
@@ -769,7 +1039,8 @@ Useful OpenShift pytest shape:
 
 ```bash
 PYTHONPATH=/tmp/vllm-overlay pytest -q \
-  /tmp/vllm-overlay/tests/model_executor/test_diffusion_gemma_fused_lse.py
+  tests/v1/worker/test_diffusion_sampler_memory_reserve.py \
+  tests/model_executor/test_diffusion_gemma_fused_lse.py
 ```
 
 ### Failed experiments and lessons
@@ -805,8 +1076,9 @@ PYTHONPATH=/tmp/vllm-overlay pytest -q \
 5. **Rowchunk 384/512**
    - Finding: larger chunks looked attractive for throughput in some normal runs,
      but failed the high-pressure discriminator.
-   - Lesson: select fallback chunk by survival margin first; `128` is the current
-     verified safe default for `auto`.
+   - Lesson: select fallback chunk by survival margin first. Later
+     autoresearch moved the verified A100/TP=1 `auto` default from `128` to
+     `256`; `384/512` failed under the pressure discriminator.
 
 6. **Triton fused full/single-pass prototypes**
    - Finding: tiny scratch and promising isolated pieces, but not serving-ready:
@@ -820,9 +1092,69 @@ PYTHONPATH=/tmp/vllm-overlay pytest -q \
    - Lesson: combine low-pressure throughput with high-pressure OOM survival;
      neither alone is sufficient.
 
+8. **Manual lower-util reserve control**
+   - Finding: lowering `gpu_memory_utilization` to 0.85 made the baseline
+     materialized sampler survive c12/c16 and beat row-chunking on throughput
+     and TTFT.
+   - Lesson: the real near-term lever is not row-chunking as a hot path; it is
+     explicit reserve/profiling for a runtime sampler spike that vLLM's startup
+     profile does not currently capture.
+
+9. **Reserve-auto prototype**
+   - Finding: user util 0.90 plus a 4.4 GiB DiffusionGemma sampler reserve
+     (`auto` scale 1.1) kept the fast materialized path, completed c3/c12/c16
+     with zero errors, and reached 296.06 c16 output tok/s in the first rerun;
+     the generic hook rerun reached 288.71 c16 output tok/s / p95 TTFT 8.59s.
+   - Lesson: reserve/profiling is now the best PR-shaped direction; row-chunking
+     remains the fallback for shapes where materialized sampling still cannot
+     safely fit.
+
 ### Where to go next
 
 Recommended next work, in order:
+
+1. **Turn reserve into an upstreamable design**
+   - the current branch has a generic model/model-runner hook and a
+     DiffusionGemma override, which is closer to the upstream shape than the
+     earlier `gpu_worker.py` prototype;
+   - still compare this hook against an alternative profiling path that forces
+     the DiffusionGemma maximum sampler allocation during startup profiling;
+   - generic worker code should continue to know only model-reported bytes, not
+     DiffusionGemma details.
+2. **Reserve validation sweep**
+   - compare reserve `auto` scale `1.0` vs `1.1` vs explicit MiB values;
+   - instrument the actual sampler/logits peak (for example allocator deltas
+     around the sampler path) and compare it to the reserve estimate;
+   - repeat c16 at user util 0.90 to verify the cliff is stable;
+   - add finite request-rate latency for reserve-auto, matching the row-chunk
+     rate=1.0 control;
+   - preserve startup KV logs and path logs for every run.
+3. **Longer soak of the reserve-auto path**
+   - same high-pressure shape;
+   - more prompts and longer wall time;
+   - include c12/c16 with 200-500 prompts if the server remains stable.
+4. **Tensor-parallel and other-shape checks**
+   - validate or reject the current rank-local-vocab reserve formula under
+     `TP>1`;
+   - test whether the reserve should be per-rank sharded vocab, full gathered
+     vocab, or model-runner-reported from observed allocation shape;
+   - check smaller GPU shapes if available.
+5. **Keep the exact row-chunk fallback**
+   - row_chunk 256 remains the best tested bounded fallback on A100/TP=1;
+   - do not pitch it as faster than reserve/materialized.
+6. **CI-runnable unit cleanup**
+   - make sure exact helper tests can run in upstream vLLM CI without the custom
+     OpenShift overlay when possible.
+7. **Future fused kernel only behind a hard gate**
+   - do not revive the current Triton prototype as serving code;
+   - de-risk a production kernel in isolation first;
+   - require exactness in low-temp/large-vocab cases, throughput parity, and a
+     demonstrated capacity benefit before wiring it into serving.
+8. **Separate logprobs work**
+   - keep the known logprobs-on bug/failure class separate from this memory PR
+     line unless the user explicitly asks to merge the efforts.
+
+Older row-chunk-only continuation items, kept for historical context:
 
 1. **Longer soak of the current adaptive baseline**
    - same high-pressure shape;
@@ -840,18 +1172,6 @@ Recommended next work, in order:
    - possibly smaller GPUs if available.
    - identify the highest adaptive concurrency / batch shape that still produces
      stable output, and report it separately from per-token speed.
-3. **CI-runnable unit cleanup**
-   - make sure exact helper tests can run in upstream vLLM CI without the custom
-     OpenShift overlay when possible.
-4. **Future fused kernel only behind a hard gate**
-   - do not revive the current Triton prototype as serving code;
-   - de-risk a production kernel in isolation first;
-   - require exactness in low-temp/large-vocab cases, throughput parity, and a
-     demonstrated capacity benefit before wiring it into serving.
-5. **Separate logprobs work**
-   - keep the known logprobs-on bug/failure class separate from this memory PR
-     line unless the user explicitly asks to merge the efforts.
-
 Before any upstream PR, add a PR-readiness checklist pass:
 
 - rebase on current upstream vLLM;
@@ -873,20 +1193,35 @@ Best one-line continuation prompt for a new session:
 Read docs/design/diffusion_gemma_adaptive_sampler_report.md on branch
 masterfoad/diffusion-gemma-adaptive-sampler-baseline-20260616 and continue
 OpenShift validation of the opt-in DiffusionGemma adaptive sampler baseline using
-STREAMED_SAMPLER=1, BACKEND=auto, ROW_CHUNK=128, and the
+STREAMED_SAMPLER=1, BACKEND=auto, ROW_CHUNK=256, and the
 max-num-batched-tokens=4096/max-num-seqs=16 pressure shape.
 ```
 
 ## Bottom line
 
-We discovered that the practical near-term win is **adaptive exact fallback**, not
-an always-on fused kernel. The backend should use the normal materialized path
-when it fits, because that path is faster. It should switch to exact row-chunking
-when sampler rows become large enough that materialization can OOM. This gives a
-clear, defensible local result: in the tested high-pressure OpenShift/A100 setup,
-`auto` survived c12/c16 where baseline failed.
+The strongest near-term result is now **sampler-spike-aware KV reservation**, not
+row-chunking as the main path and not the experimental Triton fused kernel.
 
-Future work should focus on a production-grade fused kernel only if it can keep
-exactness and serving throughput while reducing the materialized logits floor.
-Until then, `auto` + rowchunk_128 is the best verified local baseline for
-high-pressure DiffusionGemma OOM-survival experiments.
+The important discovery is that DiffusionGemma has a runtime sampler/logits
+memory spike that the startup KV profile does not adequately protect against in
+the tested high-pressure shape. If vLLM reserves enough memory for that spike,
+the existing fast materialized sampler survives and is much faster than the
+bounded row-chunk fallback.
+
+Best verified local result on A100/TP=1:
+
+- baseline util 0.90: c16 fails (`16/100` completed, `84` errors);
+- adaptive row_chunk 256: c16 succeeds but slower (`168.43` output tok/s);
+- manual util 0.85: c16 succeeds fast (`287.38` output tok/s);
+- reserve-auto at user util 0.90, scale 1.1: c16 succeeds fast (`288.71`
+  output tok/s after the model hook refactor; `296.06` in the earlier prototype),
+  with row-chunking disabled.
+
+So the PR-shaped path is:
+
+1. make DiffusionGemma's sampler reserve/profiling explicit and upstreamable;
+2. preserve the fast materialized sampler whenever the reserve says it fits;
+3. keep exact row-chunking as a fallback/escape hatch for larger or misestimated
+   shapes;
+4. keep fused-kernel work as a future project only after exactness and serving
+   throughput gates are solved.
