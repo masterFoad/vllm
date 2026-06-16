@@ -30,7 +30,6 @@ def _softcap_reduce_partial_kernel(
     partial_max: torch.Tensor,
     partial_denom: torch.Tensor,
     partial_expected: torch.Tensor,
-    partial_argmax_value: torch.Tensor,
     partial_argmax_token: torch.Tensor,
     rows: tl.constexpr,
     hidden_size: tl.constexpr,
@@ -89,7 +88,6 @@ def _softcap_reduce_partial_kernel(
     tl.store(partial_max + out_offsets, tile_max, mask=row_mask)
     tl.store(partial_denom + out_offsets, tile_denom, mask=row_mask)
     tl.store(partial_expected + out_offsets, tile_expected, mask=row_mask)
-    tl.store(partial_argmax_value + out_offsets, tile_max, mask=row_mask)
     tl.store(partial_argmax_token + out_offsets, tile_argmax_token, mask=row_mask)
 
 
@@ -148,7 +146,6 @@ def diffusion_gemma_softcap_lse_entropy_argmax(
                               dtype=torch.float32)
     partial_denom = torch.empty_like(partial_max)
     partial_expected = torch.empty_like(partial_max)
-    partial_argmax_value = torch.empty_like(partial_max)
     partial_argmax_token = torch.empty(partial_shape, device=hidden.device,
                                        dtype=torch.int64)
     grid = (triton.cdiv(rows, block_m), num_vocab_blocks)
@@ -159,7 +156,6 @@ def diffusion_gemma_softcap_lse_entropy_argmax(
         partial_max,
         partial_denom,
         partial_expected,
-        partial_argmax_value,
         partial_argmax_token,
         rows,
         hidden_size,
@@ -180,7 +176,7 @@ def diffusion_gemma_softcap_lse_entropy_argmax(
     lse = row_max + denom.log()
     entropy = lse - expected
 
-    argmax_block = partial_argmax_value.max(dim=1).indices
+    argmax_block = partial_max.max(dim=1).indices
     argmax_tokens = partial_argmax_token.gather(
         1, argmax_block[:, None]
     ).squeeze(1)
@@ -254,6 +250,134 @@ def diffusion_gemma_softcap_reductions_soft_embeds(
             (probs.to(embed_weight.dtype) @ embed_weight[start:end]).float()
         )
     return lse, entropy, argmax_tokens, soft_embeds
+
+
+def diffusion_gemma_softcap_shard_state(
+    hidden: torch.Tensor,
+    weight_shard: torch.Tensor,
+    embed_weight_shard: torch.Tensor,
+    softcap: float,
+    temperature: float,
+    *,
+    vocab_start: int = 0,
+    soft_embed_chunk_size: int = _DEFAULT_SOFT_EMBED_CHUNK,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+           torch.Tensor, torch.Tensor]:
+    """Compute mergeable online state for one vocab shard.
+
+    Returns row-wise ``(max, denom, expected, soft_embed, argmax_value,
+    argmax_token)``. ``denom``, ``expected``, and ``soft_embed`` are
+    unnormalized to the returned row max, so multiple shards can be merged with
+    the same flash-style rescaling used across vocab chunks.
+    """
+    if hidden.ndim != 2 or weight_shard.ndim != 2 or embed_weight_shard.ndim != 2:
+        raise ValueError("hidden, weight_shard, and embed_weight_shard must be rank-2")
+    if hidden.shape[1] != weight_shard.shape[1]:
+        raise ValueError("hidden and weight_shard hidden dimensions must match")
+    if weight_shard.shape[0] != embed_weight_shard.shape[0]:
+        raise ValueError("shard vocab dimensions must match")
+    if not hidden.is_cuda or not weight_shard.is_cuda or not embed_weight_shard.is_cuda:
+        raise ValueError("all inputs must be CUDA tensors")
+    if embed_weight_shard.dtype != torch.bfloat16:
+        raise ValueError("embed_weight_shard must be bfloat16 for this prototype")
+    if weight_shard.shape[0] == 0:
+        raise ValueError("weight_shard must have at least one vocab row")
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    if softcap <= 0:
+        raise ValueError("softcap must be positive")
+    if soft_embed_chunk_size <= 0:
+        raise ValueError("soft_embed_chunk_size must be positive")
+
+    hidden = hidden.contiguous()
+    weight_shard = weight_shard.contiguous()
+    embed_weight_shard = embed_weight_shard.contiguous()
+    rows = hidden.shape[0]
+    shard_vocab = weight_shard.shape[0]
+    embed_size = embed_weight_shard.shape[1]
+    device = hidden.device
+    if rows == 0:
+        empty = torch.empty((0,), device=device, dtype=torch.float32)
+        empty_tokens = torch.empty((0,), device=device, dtype=torch.int64)
+        empty_soft = torch.empty((0, embed_size), device=device,
+                                 dtype=torch.float32)
+        return empty, empty, empty, empty_soft, empty, empty_tokens
+
+    running_max = torch.full((rows,), -torch.inf, device=device,
+                             dtype=torch.float32)
+    denom = torch.zeros((rows,), device=device, dtype=torch.float32)
+    expected = torch.zeros((rows,), device=device, dtype=torch.float32)
+    soft_embed = torch.zeros((rows, embed_size), device=device,
+                             dtype=torch.float32)
+    argmax_value = torch.full((rows,), -torch.inf, device=device,
+                              dtype=torch.float32)
+    argmax_token = torch.zeros((rows,), device=device, dtype=torch.int64)
+
+    for start in range(0, shard_vocab, soft_embed_chunk_size):
+        end = min(start + soft_embed_chunk_size, shard_vocab)
+        logits = hidden @ weight_shard[start:end].t()
+        scaled = torch.tanh(logits.float() / softcap) * softcap / temperature
+        tile_max = scaled.max(dim=-1).values
+        weights = torch.exp(scaled - tile_max[:, None])
+        tile_denom = weights.sum(dim=-1)
+        tile_expected = (weights * scaled).sum(dim=-1)
+        tile_soft_embed = (
+            weights.to(embed_weight_shard.dtype)
+            @ embed_weight_shard[start:end]
+        ).float()
+
+        new_max = torch.maximum(running_max, tile_max)
+        old_scale = torch.exp(running_max - new_max)
+        tile_scale = torch.exp(tile_max - new_max)
+        denom = denom * old_scale + tile_denom * tile_scale
+        expected = expected * old_scale + tile_expected * tile_scale
+        soft_embed = (
+            soft_embed * old_scale[:, None]
+            + tile_soft_embed * tile_scale[:, None]
+        )
+        running_max = new_max
+
+        tile_argmax_value, tile_argmax_local = scaled.max(dim=-1)
+        tile_argmax_token = tile_argmax_local.to(torch.int64) + vocab_start + start
+        update_argmax = tile_argmax_value > argmax_value
+        argmax_value = torch.where(update_argmax, tile_argmax_value, argmax_value)
+        argmax_token = torch.where(update_argmax, tile_argmax_token, argmax_token)
+
+    return running_max, denom, expected, soft_embed, argmax_value, argmax_token
+
+
+def diffusion_gemma_merge_softcap_shard_states(
+    shard_states: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+                             torch.Tensor, torch.Tensor, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Merge vocab-shard states into LSE, entropy, argmax, and soft embeds."""
+    if not shard_states:
+        raise ValueError("at least one shard state is required")
+
+    shard_max = torch.stack([state[0] for state in shard_states])
+    shard_denom = torch.stack([state[1] for state in shard_states])
+    shard_expected = torch.stack([state[2] for state in shard_states])
+    shard_soft = torch.stack([state[3] for state in shard_states])
+    shard_argmax_value = torch.stack([state[4] for state in shard_states])
+    shard_argmax_token = torch.stack([state[5] for state in shard_states])
+
+    row_max = shard_max.max(dim=0).values
+    rescale = torch.exp(shard_max - row_max[None, :])
+    denom = (shard_denom * rescale).sum(dim=0)
+    expected = (shard_expected * rescale).sum(dim=0)
+    soft_embed = (shard_soft * rescale[:, :, None]).sum(dim=0) / denom[:, None]
+    lse = row_max + denom.log()
+    entropy = lse - expected / denom
+
+    argmax_value = shard_argmax_value.max(dim=0).values
+    max_int = torch.iinfo(shard_argmax_token.dtype).max
+    candidate_tokens = torch.where(
+        shard_argmax_value == argmax_value[None, :],
+        shard_argmax_token,
+        torch.full_like(shard_argmax_token, max_int),
+    )
+    argmax_token = candidate_tokens.min(dim=0).values
+    return lse, entropy, argmax_token, soft_embed
 
 
 def diffusion_gemma_softcap_lse(
