@@ -186,7 +186,16 @@ if TYPE_CHECKING:
     ] = "relax"
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
+    VLLM_USE_FLASHINFER_MOE_FP16: bool = False
+    VLLM_USE_FLASHINFER_MOE_FP8: bool = False
+    VLLM_USE_FLASHINFER_MOE_FP4: bool = False
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
+    VLLM_FLASHINFER_MOE_BACKEND: Literal["throughput", "latency", "masked_gemm"] = (
+        "latency"
+    )
+    VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8: bool = False
+    VLLM_USE_FLASHINFER_MOE_MXFP4_BF16: bool = False
+    VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
@@ -273,6 +282,19 @@ if TYPE_CHECKING:
     VLLM_ELASTIC_EP_SCALE_UP_LAUNCH: bool = False
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
+    VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_MIB: str = ""
+    VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_SCALE: float = 1.0
+    VLLM_DIFFUSION_GEMMA_STREAMED_SAMPLER: bool = False
+    VLLM_DIFFUSION_GEMMA_STREAMED_BACKEND: str = "eager"
+    VLLM_DIFFUSION_GEMMA_STREAMED_AUTO_MAX_MATERIALIZED_ROWS: int = 2048
+    VLLM_DIFFUSION_GEMMA_STREAMED_ROW_CHUNK: str = ""
+    VLLM_DIFFUSION_GEMMA_STREAMED_ROW_CHUNK_SCRATCH_MIB: int = 512
+    VLLM_DIFFUSION_GEMMA_STREAMED_CHUNK: int = 65536
+    VLLM_DIFFUSION_GEMMA_ALLOW_EXPERIMENTAL_TRITON: bool = False
+    VLLM_DIFFUSION_GEMMA_TRITON_BLOCK_M: int = 16
+    VLLM_DIFFUSION_GEMMA_TRITON_BLOCK_N: int = 128
+    VLLM_DIFFUSION_GEMMA_TRITON_BLOCK_E: int = 64
+    VLLM_DIFFUSION_GEMMA_LOG_DECODE_BATCH: bool = False
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
@@ -1473,9 +1495,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": lambda: bool(
         int(os.getenv("VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER", "1"))
     ),
+    # Legacy FlashInfer MoE envs are still queried by fused-MoE backend
+    # selection in this runtime. Keep them registered so envs.is_set() works
+    # even though the preferred public surface is --moe-backend.
+    "VLLM_USE_FLASHINFER_MOE_FP16": lambda: bool(
+        int(os.getenv("VLLM_USE_FLASHINFER_MOE_FP16", "0"))
+    ),
+    "VLLM_USE_FLASHINFER_MOE_FP8": lambda: bool(
+        int(os.getenv("VLLM_USE_FLASHINFER_MOE_FP8", "0"))
+    ),
+    "VLLM_USE_FLASHINFER_MOE_FP4": lambda: bool(
+        int(os.getenv("VLLM_USE_FLASHINFER_MOE_FP4", "0"))
+    ),
     # Allow use of FlashInfer MxInt4 MoE kernels for fused moe ops.
     "VLLM_USE_FLASHINFER_MOE_INT4": lambda: bool(
         int(os.getenv("VLLM_USE_FLASHINFER_MOE_INT4", "0"))
+    ),
+    "VLLM_FLASHINFER_MOE_BACKEND": lambda: os.getenv(
+        "VLLM_FLASHINFER_MOE_BACKEND", "latency"
+    ),
+    "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8": lambda: bool(
+        int(os.getenv("VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8", "0"))
+    ),
+    "VLLM_USE_FLASHINFER_MOE_MXFP4_BF16": lambda: bool(
+        int(os.getenv("VLLM_USE_FLASHINFER_MOE_MXFP4_BF16", "0"))
+    ),
+    "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS": lambda: bool(
+        int(os.getenv("VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS", "0"))
     ),
     # Control the cache sized used by the xgrammar compiler. The default
     # of 512 MB should be enough for roughly 1000 JSON schemas.
@@ -1894,6 +1940,49 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # memory allocation. Enabled by default as of v0.21.0
     "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": lambda: bool(
         int(os.getenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "1"))
+    ),
+    # Extra KV-sizing reserve for DiffusionGemma sampler runtime scratch.
+    # Empty or "0" disables the reserve; "auto" estimates a full-vocab fp32
+    # sampler/logits buffer; an integer value is interpreted as MiB.
+    "VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_MIB": lambda: os.getenv(
+        "VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_MIB", ""
+    ),
+    # Optional multiplier for the DiffusionGemma sampler reserve estimate.
+    "VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_SCALE": lambda: float(
+        os.getenv("VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_SCALE", "1.0")
+    ),
+    "VLLM_DIFFUSION_GEMMA_STREAMED_SAMPLER": lambda: bool(
+        int(os.getenv("VLLM_DIFFUSION_GEMMA_STREAMED_SAMPLER", "0"))
+    ),
+    "VLLM_DIFFUSION_GEMMA_STREAMED_BACKEND": lambda: os.getenv(
+        "VLLM_DIFFUSION_GEMMA_STREAMED_BACKEND", "eager"
+    ),
+    "VLLM_DIFFUSION_GEMMA_STREAMED_AUTO_MAX_MATERIALIZED_ROWS": lambda: int(
+        os.getenv("VLLM_DIFFUSION_GEMMA_STREAMED_AUTO_MAX_MATERIALIZED_ROWS", "2048")
+    ),
+    "VLLM_DIFFUSION_GEMMA_STREAMED_ROW_CHUNK": lambda: os.getenv(
+        "VLLM_DIFFUSION_GEMMA_STREAMED_ROW_CHUNK", ""
+    ),
+    "VLLM_DIFFUSION_GEMMA_STREAMED_ROW_CHUNK_SCRATCH_MIB": lambda: int(
+        os.getenv("VLLM_DIFFUSION_GEMMA_STREAMED_ROW_CHUNK_SCRATCH_MIB", "512")
+    ),
+    "VLLM_DIFFUSION_GEMMA_STREAMED_CHUNK": lambda: int(
+        os.getenv("VLLM_DIFFUSION_GEMMA_STREAMED_CHUNK", "65536")
+    ),
+    "VLLM_DIFFUSION_GEMMA_ALLOW_EXPERIMENTAL_TRITON": lambda: bool(
+        int(os.getenv("VLLM_DIFFUSION_GEMMA_ALLOW_EXPERIMENTAL_TRITON", "0"))
+    ),
+    "VLLM_DIFFUSION_GEMMA_TRITON_BLOCK_M": lambda: int(
+        os.getenv("VLLM_DIFFUSION_GEMMA_TRITON_BLOCK_M", "16")
+    ),
+    "VLLM_DIFFUSION_GEMMA_TRITON_BLOCK_N": lambda: int(
+        os.getenv("VLLM_DIFFUSION_GEMMA_TRITON_BLOCK_N", "128")
+    ),
+    "VLLM_DIFFUSION_GEMMA_TRITON_BLOCK_E": lambda: int(
+        os.getenv("VLLM_DIFFUSION_GEMMA_TRITON_BLOCK_E", "64")
+    ),
+    "VLLM_DIFFUSION_GEMMA_LOG_DECODE_BATCH": lambda: bool(
+        int(os.getenv("VLLM_DIFFUSION_GEMMA_LOG_DECODE_BATCH", "0"))
     ),
     # NIXL EP environment variables
     "VLLM_NIXL_EP_MAX_NUM_RANKS": lambda: int(

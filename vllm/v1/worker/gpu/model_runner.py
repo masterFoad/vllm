@@ -372,6 +372,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def get_model(self) -> nn.Module:
         return self.model
 
+    def get_extra_non_kv_cache_memory_bytes(self) -> int:
+        return self.model_state.get_extra_non_kv_cache_memory_bytes()
+
     def reload_weights(self, *args, **kwargs) -> None:
         # TODO(Wentao): Use full version instead of import when fully migrated to v2
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner as GPUModelRunnerV1
