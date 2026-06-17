@@ -57,6 +57,7 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.penalties import use_penalty
 
 from .diffusion_gemma_fused_lse import (
+    diffusion_gemma_resolve_gumbel_chunk_size,
     diffusion_gemma_softcap_cublas_two_pass_sample_soft_embeds,
     diffusion_gemma_softcap_online_sample_soft_embeds,
     diffusion_gemma_softcap_row_chunked_sample_soft_embeds,
@@ -86,6 +87,12 @@ _DIFFUSION_GEMMA_STREAMED_ROW_CHUNK_ENV = (
 )
 _DIFFUSION_GEMMA_STREAMED_ROW_CHUNK_SCRATCH_MIB_ENV = (
     "VLLM_DIFFUSION_GEMMA_STREAMED_ROW_CHUNK_SCRATCH_MIB"
+)
+_DIFFUSION_GEMMA_STREAMED_GUMBEL_CHUNK_ENV = (
+    "VLLM_DIFFUSION_GEMMA_STREAMED_GUMBEL_CHUNK"
+)
+_DIFFUSION_GEMMA_STREAMED_GUMBEL_SCRATCH_MIB_ENV = (
+    "VLLM_DIFFUSION_GEMMA_STREAMED_GUMBEL_SCRATCH_MIB"
 )
 
 _DIFFUSION_GEMMA_EXACT_STREAMED_BACKENDS = {
@@ -220,6 +227,26 @@ def _get_diffusion_gemma_streamed_row_chunk_size(
     if rows >= 128:
         raw_rows = max(128, (raw_rows // 128) * 128)
     return max(1, min(int(rows), int(raw_rows)))
+
+
+def _get_diffusion_gemma_streamed_gumbel_settings(
+    rows: int, soft_embed_chunk_size: int, vocab_size: int
+) -> tuple[int, int, str]:
+    """Return resolved Gumbel subchunk, scratch budget, and source label."""
+    explicit = os.environ.get(_DIFFUSION_GEMMA_STREAMED_GUMBEL_CHUNK_ENV, "")
+    scratch_mib = int(
+        os.environ.get(_DIFFUSION_GEMMA_STREAMED_GUMBEL_SCRATCH_MIB_ENV, "1024")
+    )
+    requested = int(explicit) if explicit else 0
+    chunk = diffusion_gemma_resolve_gumbel_chunk_size(
+        rows,
+        soft_embed_chunk_size,
+        vocab_size,
+        requested,
+        scratch_mib,
+    )
+    source = f"explicit:{requested}" if requested > 0 else "auto"
+    return chunk, scratch_mib, source
 
 
 class DiffusionGemmaSelfConditioning(nn.Module):
@@ -1683,27 +1710,66 @@ class DiffusionSampler:
             row_chunk_size = _get_diffusion_gemma_streamed_row_chunk_size(
                 sampler_rows, self.vocab_size
             )
+            streamed_vocab_chunk_default = (
+                "8192" if streamed_backend == "cublas_two_pass" else "65536"
+            )
+            streamed_vocab_chunk = int(
+                os.environ.get(
+                    "VLLM_DIFFUSION_GEMMA_STREAMED_CHUNK",
+                    streamed_vocab_chunk_default,
+                )
+            )
+            gumbel_chunk_size, gumbel_scratch_mib, gumbel_chunk_source = (
+                _get_diffusion_gemma_streamed_gumbel_settings(
+                    sampler_rows, streamed_vocab_chunk, self.vocab_size
+                )
+            )
             if not self._streamed_sampler_logged:
                 logger.warning_once(
                     "DiffusionGemma streamed sampler path is active "
                     "(logprobs disabled, backend=%s, effective_backend=%s, "
-                    "sampler_rows=%s, auto_max_materialized_rows=%s, "
-                    "vocab_chunk=%s, row_chunk=%s, row_chunk_scratch_mib=%s).",
+                    "auto_max_materialized_rows=%s, vocab_chunk=%s, "
+                    "gumbel_chunk_env=%s, gumbel_scratch_mib=%s, "
+                    "row_chunk_env=%s, row_chunk_scratch_mib=%s). "
+                    "Resolved Gumbel and row chunks are batch-size dependent; "
+                    "set VLLM_DIFFUSION_GEMMA_LOG_DECODE_BATCH=1 for per-step "
+                    "sampler_rows diagnostics.",
                     self._streamed_backend,
                     streamed_backend,
-                    sampler_rows,
                     os.environ.get(
                         "VLLM_DIFFUSION_GEMMA_STREAMED_AUTO_MAX_MATERIALIZED_ROWS",
                         "2048",
                     ),
-                    os.environ.get("VLLM_DIFFUSION_GEMMA_STREAMED_CHUNK", "65536"),
-                    row_chunk_size,
+                    streamed_vocab_chunk,
+                    os.environ.get(
+                        _DIFFUSION_GEMMA_STREAMED_GUMBEL_CHUNK_ENV, "auto"
+                    )
+                    or "auto",
+                    gumbel_scratch_mib,
+                    os.environ.get(_DIFFUSION_GEMMA_STREAMED_ROW_CHUNK_ENV, "auto")
+                    or "auto",
                     os.environ.get(
                         _DIFFUSION_GEMMA_STREAMED_ROW_CHUNK_SCRATCH_MIB_ENV,
                         "512",
                     ),
                 )
                 self._streamed_sampler_logged = True
+            if (
+                os.environ.get("VLLM_DIFFUSION_GEMMA_LOG_DECODE_BATCH", "0") == "1"
+                and self._decode_batch_log_count <= 64
+            ):
+                logger.warning(
+                    "DiffusionGemma streamed sampler dynamic chunks: "
+                    "sampler_rows=%d vocab_chunk=%d resolved_gumbel_chunk=%d "
+                    "gumbel_chunk_source=%s gumbel_scratch_mib=%d "
+                    "resolved_row_chunk=%d.",
+                    sampler_rows,
+                    streamed_vocab_chunk,
+                    gumbel_chunk_size,
+                    gumbel_chunk_source,
+                    gumbel_scratch_mib,
+                    row_chunk_size,
+                )
             steps_f = states.step[decode_slots].float()
             remaining = (float(states.max_denoising_steps) - steps_f).clamp(min=1.0)
             temp = self.t_min + (self.t_max - self.t_min) * (
@@ -1724,11 +1790,9 @@ class DiffusionSampler:
                         float(self.final_logit_softcapping),
                         temperature,
                         self._stream_seed,
-                        chunk_size=int(
-                            os.environ.get(
-                                "VLLM_DIFFUSION_GEMMA_STREAMED_CHUNK", "8192"
-                            )
-                        ),
+                        chunk_size=streamed_vocab_chunk,
+                        gumbel_chunk_size=gumbel_chunk_size,
+                        gumbel_scratch_mib=gumbel_scratch_mib,
                         row_seed_offsets=stream_row_seed_offsets,
                     )
                 )
@@ -1780,11 +1844,10 @@ class DiffusionSampler:
                         float(self.final_logit_softcapping),
                         temperature,
                         self._stream_seed,
-                        soft_embed_chunk_size=int(
-                            os.environ.get(
-                                "VLLM_DIFFUSION_GEMMA_STREAMED_CHUNK", "65536"
-                            )
-                        ),
+                        soft_embed_chunk_size=streamed_vocab_chunk,
+                        gumbel_chunk_size=gumbel_chunk_size,
+                        gumbel_scratch_mib=gumbel_scratch_mib,
+                        row_seed_offsets=stream_row_seed_offsets,
                     )
                 )
             del lse

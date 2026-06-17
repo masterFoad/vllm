@@ -12,11 +12,13 @@ from vllm.model_executor.models.diffusion_gemma import (
     DiffusionGemmaRequestStates,
     DiffusionSampler,
     _get_diffusion_gemma_streamed_backend,
+    _get_diffusion_gemma_streamed_gumbel_settings,
     _get_diffusion_gemma_streamed_row_chunk_size,
     _resolve_diffusion_gemma_streamed_backend_for_rows,
 )
 from vllm.model_executor.models.diffusion_gemma_fused_lse import (
     _stable_uniform_from_indices,
+    diffusion_gemma_resolve_gumbel_chunk_size,
     diffusion_gemma_merge_gumbel_shard_states,
     diffusion_gemma_merge_softcap_shard_states,
     diffusion_gemma_softcap_cublas_two_pass_sample_soft_embeds,
@@ -139,6 +141,54 @@ def test_diffusion_gemma_streamed_row_chunk_size_from_scratch_budget(monkeypatch
     monkeypatch.setenv("VLLM_DIFFUSION_GEMMA_STREAMED_ROW_CHUNK", "384")
     assert _get_diffusion_gemma_streamed_row_chunk_size(2048, 262144) == 384
     assert _get_diffusion_gemma_streamed_row_chunk_size(128, 262144) == 128
+
+
+def test_diffusion_gemma_streamed_gumbel_chunk_size_from_scratch_budget(
+    monkeypatch,
+):
+    monkeypatch.delenv("VLLM_DIFFUSION_GEMMA_STREAMED_GUMBEL_CHUNK",
+                       raising=False)
+    monkeypatch.delenv(
+        "VLLM_DIFFUSION_GEMMA_STREAMED_GUMBEL_SCRATCH_MIB",
+        raising=False,
+    )
+
+    # Default 1024 MiB budget gives the previous safe c16 value:
+    # floor(1024MiB / (4096 rows * 32B conservative scratch/elem)) = 8192.
+    chunk, scratch_mib, source = _get_diffusion_gemma_streamed_gumbel_settings(
+        rows=4096, soft_embed_chunk_size=32768, vocab_size=262144)
+    assert (chunk, scratch_mib, source) == (8192, 1024, "auto")
+
+    # Lower row pressure can use a larger RNG tile without shrinking the GEMM
+    # chunk; high row pressure shrinks only Gumbel/noisy-argmax scratch.
+    assert diffusion_gemma_resolve_gumbel_chunk_size(
+        rows=1024,
+        soft_embed_chunk_size=32768,
+        vocab_size=262144,
+        requested_chunk=0,
+        scratch_mib=1024,
+    ) == 32768
+    assert diffusion_gemma_resolve_gumbel_chunk_size(
+        rows=8192,
+        soft_embed_chunk_size=32768,
+        vocab_size=262144,
+        requested_chunk=0,
+        scratch_mib=1024,
+    ) == 4096
+
+    monkeypatch.setenv("VLLM_DIFFUSION_GEMMA_STREAMED_GUMBEL_CHUNK", "1234")
+    chunk, scratch_mib, source = _get_diffusion_gemma_streamed_gumbel_settings(
+        rows=4096, soft_embed_chunk_size=32768, vocab_size=262144)
+    assert (chunk, scratch_mib, source) == (1234, 1024, "explicit:1234")
+
+    # Explicit values and huge budgets never exceed the outer vocab tile.
+    assert diffusion_gemma_resolve_gumbel_chunk_size(
+        rows=1,
+        soft_embed_chunk_size=181,
+        vocab_size=541,
+        requested_chunk=999999,
+        scratch_mib=1024,
+    ) == 181
 
 
 def test_diffusion_gemma_sampler_uses_streamed_auto_row_chunked_path(
@@ -1017,6 +1067,95 @@ def test_diffusion_gemma_online_sample_soft_embeds_chunk_size_invariant():
                                    atol=2e-2)
 
 
+def test_diffusion_gemma_online_sample_soft_embeds_gumbel_chunk_invariant():
+    hidden, weight = _make_inputs(rows=6, hidden_size=80, vocab_size=541)
+    embed_weight = _make_embed_weight(vocab_size=541, embed_size=32,
+                                      seed=2026063201)
+    expected = diffusion_gemma_softcap_online_sample_soft_embeds(
+        hidden,
+        weight,
+        embed_weight,
+        softcap=30.0,
+        temperature=0.7,
+        seed=2026063301,
+        soft_embed_chunk_size=181,
+        gumbel_chunk_size=181,
+    )
+
+    for gumbel_chunk_size in (None, -1, 0, 1, 7, 53, 128, 30000, 999999):
+        actual = diffusion_gemma_softcap_online_sample_soft_embeds(
+            hidden,
+            weight,
+            embed_weight,
+            softcap=30.0,
+            temperature=0.7,
+            seed=2026063301,
+            soft_embed_chunk_size=181,
+            gumbel_chunk_size=gumbel_chunk_size,
+            gumbel_scratch_mib=1,
+        )
+        torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+        torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+        torch.testing.assert_close(actual[2], expected[2], rtol=0, atol=0)
+        torch.testing.assert_close(actual[3], expected[3], rtol=0, atol=0)
+        torch.testing.assert_close(actual[4], expected[4], rtol=0, atol=0)
+
+
+def test_diffusion_gemma_online_sample_soft_embeds_row_seed_offsets_are_reorder_stable():
+    hidden, weight = _make_inputs(rows=8, hidden_size=80, vocab_size=541)
+    embed_weight = _make_embed_weight(vocab_size=541, embed_size=32,
+                                      seed=2026063202)
+    row_seed_offsets = torch.tensor([11, 3, 20, 7, 15, 99, 2, 42],
+                                    device="cuda", dtype=torch.int64)
+    temperature = torch.full((8,), 0.7, device="cuda", dtype=torch.float32)
+    expected = diffusion_gemma_softcap_online_sample_soft_embeds(
+        hidden, weight, embed_weight, softcap=30.0, temperature=temperature,
+        seed=2026063302, soft_embed_chunk_size=113, gumbel_chunk_size=17,
+        row_seed_offsets=row_seed_offsets,
+    )
+
+    perm = torch.tensor([5, 0, 7, 1, 6, 2, 4, 3], device="cuda")
+    inv = torch.empty_like(perm)
+    inv[perm] = torch.arange(perm.numel(), device="cuda")
+    actual = diffusion_gemma_softcap_online_sample_soft_embeds(
+        hidden[perm], weight, embed_weight, softcap=30.0,
+        temperature=temperature[perm], seed=2026063302,
+        soft_embed_chunk_size=113, gumbel_chunk_size=17,
+        row_seed_offsets=row_seed_offsets[perm],
+    )
+
+    for idx in (0, 1, 2, 3, 4):
+        tol = {0: (3e-4, 2e-3), 1: (1e-3, 1e-3), 4: (2e-2, 2e-2)}.get(idx, (0, 0))
+        torch.testing.assert_close(actual[idx][inv], expected[idx],
+                                   rtol=tol[0], atol=tol[1])
+
+
+def test_diffusion_gemma_online_sample_soft_embeds_zero_temp_rows_are_greedy():
+    hidden, weight = _make_inputs(rows=5, hidden_size=64, vocab_size=257)
+    embed_weight = _make_embed_weight(vocab_size=257, embed_size=32,
+                                      seed=2026063203)
+    temperature = torch.tensor([0.0, 0.7, 0.0, 1.1, 0.0], device="cuda",
+                               dtype=torch.float32)
+
+    actual = diffusion_gemma_softcap_online_sample_soft_embeds(
+        hidden, weight, embed_weight, softcap=30.0, temperature=temperature,
+        seed=2026063303, soft_embed_chunk_size=64, gumbel_chunk_size=17,
+    )
+
+    zero_rows = temperature == 0
+    torch.testing.assert_close(actual[2][zero_rows], actual[3][zero_rows],
+                               rtol=0, atol=0)
+    torch.testing.assert_close(actual[1][zero_rows],
+                               torch.zeros_like(actual[1][zero_rows]),
+                               rtol=0, atol=0)
+    torch.testing.assert_close(
+        actual[4][zero_rows],
+        embed_weight[actual[3][zero_rows]].float(),
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_diffusion_gemma_online_sample_soft_embeds_accepts_row_temperature():
     hidden, weight = _make_inputs(rows=6, hidden_size=64, vocab_size=257)
     embed_weight = _make_embed_weight(vocab_size=257, embed_size=32,
@@ -1105,7 +1244,12 @@ def test_diffusion_gemma_cublas_two_pass_chunk_size_invariant():
         chunk_size=257,
     )
 
-    for chunk_size in (1, 63, 128):
+    for chunk_size, gumbel_chunk_size in (
+        (1, None),
+        (63, -1),
+        (128, 0),
+        (128, 64),
+    ):
         actual = diffusion_gemma_softcap_cublas_two_pass_sample_soft_embeds(
             hidden,
             weight,
@@ -1114,6 +1258,8 @@ def test_diffusion_gemma_cublas_two_pass_chunk_size_invariant():
             temperature=0.7,
             seed=20260645,
             chunk_size=chunk_size,
+            gumbel_chunk_size=gumbel_chunk_size,
+            gumbel_scratch_mib=1,
         )
         torch.testing.assert_close(actual[0], expected[0], rtol=3e-4,
                                    atol=2e-3)

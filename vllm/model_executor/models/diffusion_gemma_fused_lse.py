@@ -25,6 +25,18 @@ _DEFAULT_BLOCK_K = 64
 _DEFAULT_SOFT_EMBED_CHUNK = 32768
 _DEFAULT_NUM_WARPS = 8
 _GUMBEL_CHUNK = 32768
+# Separate RNG/Gumbel scratch knob for the online eager path.  The GEMM/soft
+# embedding chunk can stay large for throughput, while Gumbel-max is subchunked
+# to avoid materializing [rows, vocab_chunk] int64/float64 RNG temporaries.
+_DEFAULT_ONLINE_GUMBEL_CHUNK = 8192
+_DEFAULT_ONLINE_GUMBEL_SCRATCH_MIB = 1024
+# Conservative estimate for the eager Gumbel path.  The stateless RNG creates
+# int64 hash temporaries, a float64 mantissa conversion, float32 uniforms, log
+# temporaries, and a noisy score tile.  This is intentionally a budget heuristic,
+# not an exact allocator model; OpenShift pressure tests are the source of truth.
+_GUMBEL_SCRATCH_BYTES_PER_ELEMENT = 32
+_MIN_ONLINE_GUMBEL_CHUNK = 512
+_GUMBEL_CHUNK_ALIGNMENT = 512
 _INT64_MIX_A = -7046029254386353131
 _INT64_MIX_B = -4658895280553007687
 _INT64_MIX_C = -7723592293110705685
@@ -579,6 +591,101 @@ def _stable_uniform_from_indices(
     return ((mantissa + 0.5) * _FLOAT_2_NEG_53).to(torch.float32)
 
 
+def diffusion_gemma_resolve_gumbel_chunk_size(
+    rows: int,
+    soft_embed_chunk_size: int,
+    vocab_size: int,
+    requested_chunk: int | None,
+    scratch_mib: int = _DEFAULT_ONLINE_GUMBEL_SCRATCH_MIB,
+) -> int:
+    """Resolve the online/eager Gumbel subchunk size.
+
+    Positive ``requested_chunk`` is an explicit user knob. ``None`` or ``<=0``
+    asks for an automatic chunk derived from a scratch-memory budget. Only the
+    Gumbel/RNG/noisy-argmax tile is subchunked; the GEMM/soft-embed vocab chunk
+    stays controlled by ``soft_embed_chunk_size`` so the fast tensor-core work is
+    not accidentally shrunk.
+    """
+    if soft_embed_chunk_size <= 0:
+        raise ValueError("soft_embed_chunk_size must be positive")
+    if vocab_size <= 0:
+        raise ValueError("vocab_size must be positive")
+
+    max_chunk = min(int(soft_embed_chunk_size), int(vocab_size))
+    if requested_chunk is not None and int(requested_chunk) > 0:
+        return max(1, min(int(requested_chunk), max_chunk))
+
+    if scratch_mib <= 0:
+        raise ValueError("gumbel scratch MiB must be positive")
+
+    budget_bytes = int(scratch_mib) << 20
+    raw_chunk = budget_bytes // (
+        max(1, int(rows)) * _GUMBEL_SCRATCH_BYTES_PER_ELEMENT
+    )
+    chunk = max(_MIN_ONLINE_GUMBEL_CHUNK, int(raw_chunk))
+    chunk = min(chunk, max_chunk)
+    if chunk >= _GUMBEL_CHUNK_ALIGNMENT:
+        chunk = (chunk // _GUMBEL_CHUNK_ALIGNMENT) * _GUMBEL_CHUNK_ALIGNMENT
+    return max(1, int(chunk))
+
+
+def _update_gumbel_sample_from_scaled_tile(
+    scaled: torch.Tensor,
+    *,
+    vocab_start: int,
+    row_seed_offsets: torch.Tensor,
+    seed: int,
+    sample_value: torch.Tensor,
+    sample_token: torch.Tensor,
+    noise_scale: float | torch.Tensor,
+    gumbel_chunk_size: int,
+    generate_noise: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Update running Gumbel-max without full-tile RNG materialization.
+
+    ``scaled`` may be a large GEMM/soft-embed tile.  The old prototype built a
+    full ``[rows, scaled.shape[1]]`` random tile, which creates multiple large
+    int64/float64 temporaries.  Split only the RNG/noisy-argmax work; this keeps
+    the larger tensor-core GEMM chunk intact while bounding sampler RNG scratch.
+    ``row_seed_offsets`` and absolute vocab ids preserve token-index-stable
+    samples across different Gumbel subchunk sizes.
+    """
+    if gumbel_chunk_size <= 0:
+        raise ValueError("gumbel_chunk_size must be positive")
+
+    width = scaled.shape[1]
+    device = scaled.device
+    for rel_start in range(0, width, gumbel_chunk_size):
+        rel_end = min(rel_start + gumbel_chunk_size, width)
+        scaled_sub = scaled[:, rel_start:rel_end]
+        abs_start = vocab_start + rel_start
+        if generate_noise:
+            token_offsets = torch.arange(
+                abs_start,
+                vocab_start + rel_end,
+                device=device,
+                dtype=torch.int64,
+            )
+            uniform = _stable_uniform_from_indices(
+                row_seed_offsets, token_offsets, seed
+            )
+            uniform = uniform.clamp(
+                min=torch.finfo(uniform.dtype).tiny,
+                max=1.0 - torch.finfo(uniform.dtype).eps,
+            )
+            noisy_sub = scaled_sub + (-torch.log(-torch.log(uniform))) * noise_scale
+        else:
+            noisy_sub = scaled_sub
+
+        tile_sample_value, tile_sample_local = noisy_sub.max(dim=-1)
+        tile_sample_token = tile_sample_local.to(torch.int64) + abs_start
+        update_sample = tile_sample_value > sample_value
+        sample_value = torch.where(update_sample, tile_sample_value, sample_value)
+        sample_token = torch.where(update_sample, tile_sample_token, sample_token)
+
+    return sample_value, sample_token
+
+
 def diffusion_gemma_softcap_gumbel_shard_state(
     hidden: torch.Tensor,
     weight_shard: torch.Tensor,
@@ -635,6 +742,10 @@ def diffusion_gemma_softcap_gumbel_shard_state(
         if temperature > 0:
             uniform = _stable_uniform_from_indices(row_offsets, token_offsets,
                                                    seed)
+            uniform = uniform.clamp(
+                min=torch.finfo(uniform.dtype).tiny,
+                max=1.0 - torch.finfo(uniform.dtype).eps,
+            )
             gumbel = -torch.log(-torch.log(uniform))
             noisy = scaled + gumbel
         else:
@@ -698,6 +809,9 @@ def diffusion_gemma_softcap_online_sample_soft_embeds(
     seed: int,
     *,
     soft_embed_chunk_size: int = _DEFAULT_SOFT_EMBED_CHUNK,
+    gumbel_chunk_size: int | None = _DEFAULT_ONLINE_GUMBEL_CHUNK,
+    gumbel_scratch_mib: int = _DEFAULT_ONLINE_GUMBEL_SCRATCH_MIB,
+    row_seed_offsets: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor]:
     """Compute sampler-shaped outputs in one token-index-stable vocab pass.
@@ -746,7 +860,33 @@ def diffusion_gemma_softcap_online_sample_soft_embeds(
                                  dtype=torch.float32)
         return empty, empty, empty_tokens, empty_tokens, empty_soft
 
-    row_offsets = torch.arange(rows, device=device, dtype=torch.int64)
+    if row_seed_offsets is None:
+        row_seed_offsets = torch.arange(rows, device=device, dtype=torch.int64)
+    else:
+        if row_seed_offsets.ndim != 1 or row_seed_offsets.shape[0] != rows:
+            raise ValueError("row_seed_offsets must have shape [rows]")
+        if not row_seed_offsets.is_cuda:
+            raise ValueError("row_seed_offsets must be CUDA")
+        row_seed_offsets = row_seed_offsets.to(device=device, dtype=torch.int64)
+
+    if isinstance(temperature, torch.Tensor):
+        zero_temp_rows = temperature <= 0
+        generate_noise = bool((temperature > 0).any().item())
+    else:
+        zero_temp_rows = torch.full((rows,), temperature <= 0, device=device,
+                                    dtype=torch.bool)
+        generate_noise = temperature > 0
+    if generate_noise:
+        gumbel_chunk_size = diffusion_gemma_resolve_gumbel_chunk_size(
+            rows,
+            soft_embed_chunk_size,
+            vocab,
+            gumbel_chunk_size,
+            gumbel_scratch_mib,
+        )
+    else:
+        gumbel_chunk_size = min(int(soft_embed_chunk_size), int(vocab))
+
     running_max = torch.full((rows,), -torch.inf, device=device,
                              dtype=torch.float32)
     denom = torch.zeros((rows,), device=device, dtype=torch.float32)
@@ -765,13 +905,18 @@ def diffusion_gemma_softcap_online_sample_soft_embeds(
         token_offsets = torch.arange(start, end, device=device,
                                      dtype=torch.int64)
         logits = hidden @ weight[start:end].t()
+        unscaled = torch.tanh(logits.float() / softcap) * softcap
         if isinstance(temperature, torch.Tensor):
             temp_safe = temperature[:, None].clamp(min=1e-10)
             noise_scale = (temperature[:, None] > 0).to(torch.float32)
+            scaled = unscaled / temp_safe
+            scaled = torch.where(zero_temp_rows[:, None], unscaled, scaled)
         else:
             temp_safe = max(float(temperature), 1e-10)
             noise_scale = 1.0 if temperature > 0 else 0.0
-        scaled = torch.tanh(logits.float() / softcap) * softcap / temp_safe
+            scaled = unscaled / temp_safe
+            if temperature <= 0:
+                scaled = unscaled
 
         tile_max = scaled.max(dim=-1).values
         weights = torch.exp(scaled - tile_max[:, None])
@@ -801,19 +946,25 @@ def diffusion_gemma_softcap_online_sample_soft_embeds(
         greedy_token = torch.where(update_greedy, tile_greedy_token,
                                    greedy_token)
 
-        uniform = _stable_uniform_from_indices(row_offsets, token_offsets, seed)
-        noisy = scaled + (-torch.log(-torch.log(uniform))) * noise_scale
-        tile_sample_value, tile_sample_local = noisy.max(dim=-1)
-        tile_sample_token = tile_sample_local.to(torch.int64) + start
-        update_sample = tile_sample_value > sample_value
-        sample_value = torch.where(update_sample, tile_sample_value,
-                                   sample_value)
-        sample_token = torch.where(update_sample, tile_sample_token,
-                                   sample_token)
+        sample_value, sample_token = _update_gumbel_sample_from_scaled_tile(
+            scaled,
+            vocab_start=start,
+            row_seed_offsets=row_seed_offsets,
+            seed=seed,
+            sample_value=sample_value,
+            sample_token=sample_token,
+            noise_scale=noise_scale,
+            gumbel_chunk_size=min(gumbel_chunk_size, end - start),
+            generate_noise=generate_noise,
+        )
 
     lse = running_max + denom.log()
     entropy = lse - expected / denom
-    return lse, entropy, sample_token, greedy_token, soft_embed / denom[:, None]
+    entropy = torch.where(zero_temp_rows, torch.zeros_like(entropy), entropy)
+    soft_embed = soft_embed / denom[:, None]
+    if zero_temp_rows.any():
+        soft_embed[zero_temp_rows] = embed_weight[greedy_token[zero_temp_rows]].float()
+    return lse, entropy, sample_token, greedy_token, soft_embed
 
 
 def diffusion_gemma_softcap_cublas_two_pass_sample_soft_embeds(
@@ -825,6 +976,8 @@ def diffusion_gemma_softcap_cublas_two_pass_sample_soft_embeds(
     seed: int,
     *,
     chunk_size: int = 8192,
+    gumbel_chunk_size: int | None = None,
+    gumbel_scratch_mib: int = _DEFAULT_ONLINE_GUMBEL_SCRATCH_MIB,
     row_seed_offsets: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
            torch.Tensor]:
@@ -902,9 +1055,21 @@ def diffusion_gemma_softcap_cublas_two_pass_sample_soft_embeds(
 
     if isinstance(temperature, torch.Tensor):
         zero_temp_rows = temperature <= 0
+        generate_noise = bool((temperature > 0).any().item())
     else:
         zero_temp_rows = torch.full((rows,), temperature <= 0, device=device,
                                     dtype=torch.bool)
+        generate_noise = temperature > 0
+    if generate_noise:
+        gumbel_chunk_size = diffusion_gemma_resolve_gumbel_chunk_size(
+            rows,
+            chunk_size,
+            vocab,
+            chunk_size if gumbel_chunk_size is None else gumbel_chunk_size,
+            gumbel_scratch_mib,
+        )
+    else:
+        gumbel_chunk_size = min(int(chunk_size), int(vocab))
 
     running_max = torch.full((rows,), -torch.inf, device=device,
                              dtype=torch.float32)
@@ -952,19 +1117,17 @@ def diffusion_gemma_softcap_cublas_two_pass_sample_soft_embeds(
         greedy_token = torch.where(update_greedy, tile_greedy_token,
                                    greedy_token)
 
-        uniform = _stable_uniform_from_indices(row_seed_offsets, token_offsets, seed)
-        uniform = uniform.clamp(
-            min=torch.finfo(uniform.dtype).tiny,
-            max=1.0 - torch.finfo(uniform.dtype).eps,
+        sample_value, sample_token = _update_gumbel_sample_from_scaled_tile(
+            scaled,
+            vocab_start=start,
+            row_seed_offsets=row_seed_offsets,
+            seed=seed,
+            sample_value=sample_value,
+            sample_token=sample_token,
+            noise_scale=chunk_noise_scale,
+            gumbel_chunk_size=min(gumbel_chunk_size, end - start),
+            generate_noise=generate_noise,
         )
-        noisy = scaled + (-torch.log(-torch.log(uniform))) * chunk_noise_scale
-        tile_sample_value, tile_sample_local = noisy.max(dim=-1)
-        tile_sample_token = tile_sample_local.to(torch.int64) + start
-        update_sample = tile_sample_value > sample_value
-        sample_value = torch.where(update_sample, tile_sample_value,
-                                   sample_value)
-        sample_token = torch.where(update_sample, tile_sample_token,
-                                   sample_token)
 
     lse = running_max + denom.log()
     entropy = lse - expected / denom
