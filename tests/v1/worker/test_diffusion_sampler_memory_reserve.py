@@ -50,7 +50,7 @@ def test_diffusion_sampler_memory_reserve_strips_whitespace():
             canvas_length=256,
             vocab_size=1024,
         )
-        == 256 * 1024 * 4
+        == 256 * 1024 * 4 * 2
     )
 
 
@@ -64,7 +64,7 @@ def test_diffusion_sampler_memory_reserve_accepts_uppercase_auto():
             canvas_length=256,
             vocab_size=1024,
         )
-        == 256 * 1024 * 4
+        == 256 * 1024 * 4 * 2
     )
 
 
@@ -92,7 +92,7 @@ def test_diffusion_sampler_memory_reserve_auto_estimate():
         vocab_size=262144,
     )
 
-    assert reserve == 16 * 256 * 262144 * 4
+    assert reserve == 16 * 256 * 262144 * 4 * 2
 
 
 def test_diffusion_sampler_memory_reserve_auto_respects_token_cap():
@@ -107,7 +107,7 @@ def test_diffusion_sampler_memory_reserve_auto_respects_token_cap():
 
     # max_num_batched_tokens limits the materialized decode shape to 16
     # diffusion requests, not max_num_seqs=64.
-    assert reserve == int(16 * 256 * 1024 * 4 * 1.25)
+    assert reserve == int(16 * 256 * 1024 * 4 * 2 * 1.25)
 
 
 def test_diffusion_sampler_memory_reserve_rejects_negative():
@@ -179,5 +179,5 @@ def test_diffusion_model_state_reports_global_vocab_reserve(monkeypatch):
     )
 
     assert state.get_extra_non_kv_cache_memory_bytes() == int(
-        16 * 256 * 262144 * 4 * 1.1
+        16 * 256 * 262144 * 4 * 2 * 1.1
     )

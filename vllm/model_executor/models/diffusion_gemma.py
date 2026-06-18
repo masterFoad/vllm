@@ -110,8 +110,11 @@ def _get_diffusion_gemma_sampler_memory_reserve_bytes(
         max(1, int(max_num_batched_tokens) // int(canvas_length)),
     )
     sampler_rows = max_decode_reqs * int(canvas_length)
-    # DiffusionGemma's materialized sampler scratch is fp32.
-    return int(sampler_rows * int(vocab_size) * 4 * reserve_scale)
+    # DiffusionGemma's materialized decode path can have more than one
+    # full-vocab fp32 transient live across logits softcap/gather/sampler.
+    # Reserve two [sampler_rows, global_vocab] fp32 buffers for the auto
+    # setting; callers can still tune this with the scale env.
+    return int(sampler_rows * int(vocab_size) * 4 * 2 * reserve_scale)
 
 
 class DiffusionGemmaSelfConditioning(nn.Module):
