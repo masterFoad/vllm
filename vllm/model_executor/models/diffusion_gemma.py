@@ -55,6 +55,9 @@ from vllm.v1.worker.gpu.sample.logprob import compute_topk_logprobs
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.penalties import use_penalty
 
+from .diffusion_gemma_rowchunk import (
+    diffusion_gemma_softcap_row_chunked_sample_soft_embeds,
+)
 from .interfaces import (
     SupportsMultiModal,
     SupportsPP,
@@ -69,6 +72,17 @@ _DIFFUSION_GEMMA_SAMPLER_RESERVE_ENV = (
 _DIFFUSION_GEMMA_SAMPLER_RESERVE_SCALE_ENV = (
     "VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_SCALE"
 )
+_DIFFUSION_GEMMA_SAMPLER_BACKEND_ENV = "VLLM_DIFFUSION_GEMMA_SAMPLER_BACKEND"
+_DIFFUSION_GEMMA_AUTO_MAX_ROWS_ENV = (
+    "VLLM_DIFFUSION_GEMMA_AUTO_MAX_MATERIALIZED_ROWS"
+)
+_DIFFUSION_GEMMA_ROW_CHUNK_ENV = "VLLM_DIFFUSION_GEMMA_ROW_CHUNK"
+_DIFFUSION_GEMMA_ROW_CHUNK_SCRATCH_MIB_ENV = (
+    "VLLM_DIFFUSION_GEMMA_ROW_CHUNK_SCRATCH_MIB"
+)
+_DIFFUSION_GEMMA_SAMPLER_BACKENDS = {"materialized", "auto", "row_chunked"}
+_DIFFUSION_GEMMA_ROW_CHUNK_BYTES_PER_ELEMENT = 64
+_DIFFUSION_GEMMA_ROW_CHUNK_ALIGNMENT = 64
 
 
 def _get_diffusion_gemma_sampler_memory_reserve_bytes(
@@ -115,6 +129,84 @@ def _get_diffusion_gemma_sampler_memory_reserve_bytes(
     # Reserve two [sampler_rows, global_vocab] fp32 buffers for the auto
     # setting; callers can still tune this with the scale env.
     return int(sampler_rows * int(vocab_size) * 4 * 2 * reserve_scale)
+
+
+def _get_diffusion_gemma_sampler_backend() -> str:
+    backend = envs.VLLM_DIFFUSION_GEMMA_SAMPLER_BACKEND.strip().lower()
+    if backend not in _DIFFUSION_GEMMA_SAMPLER_BACKENDS:
+        supported = ", ".join(sorted(_DIFFUSION_GEMMA_SAMPLER_BACKENDS))
+        raise ValueError(
+            f"{_DIFFUSION_GEMMA_SAMPLER_BACKEND_ENV}={backend!r} is not "
+            f"supported; expected one of: {supported}"
+        )
+    return backend
+
+
+def _resolve_diffusion_gemma_sampler_backend_for_rows(
+    backend: str, sampler_rows: int
+) -> str:
+    if backend != "auto":
+        return backend
+    threshold = envs.VLLM_DIFFUSION_GEMMA_AUTO_MAX_MATERIALIZED_ROWS
+    if threshold < 0:
+        raise ValueError(f"{_DIFFUSION_GEMMA_AUTO_MAX_ROWS_ENV} must be >= 0")
+    if sampler_rows <= threshold:
+        return "materialized"
+    return "row_chunked"
+
+
+def _is_diffusion_gemma_sampler_warmup_batch(input_batch: Any) -> bool:
+    req_ids = getattr(input_batch, "req_ids", ())
+    num_reqs = getattr(input_batch, "num_reqs", 0)
+    return num_reqs > 0 and all(
+        str(req_id).startswith("_warmup_") for req_id in req_ids[:num_reqs]
+    )
+
+
+def _is_diffusion_gemma_hidden_state_input(
+    logits: torch.Tensor, vocab_size: int, hidden_size: int
+) -> bool:
+    last_dim = logits.shape[-1]
+    is_materialized_logits = last_dim == vocab_size
+    is_hidden_states = last_dim == hidden_size
+    if not is_materialized_logits and not is_hidden_states:
+        raise ValueError(
+            "DiffusionGemma row-chunked sampler expected hidden states "
+            f"with hidden size {hidden_size} or materialized logits with "
+            f"vocab size {vocab_size}, got shape {tuple(logits.shape)}."
+        )
+    return is_hidden_states
+
+
+def _get_diffusion_gemma_row_chunk_size(rows: int, vocab_size: int) -> int:
+    if rows < 0:
+        raise ValueError("rows must be >= 0")
+    if vocab_size <= 0:
+        raise ValueError("vocab_size must be positive")
+    if rows == 0:
+        return 1
+
+    explicit = envs.VLLM_DIFFUSION_GEMMA_ROW_CHUNK
+    if explicit < 0:
+        raise ValueError(f"{_DIFFUSION_GEMMA_ROW_CHUNK_ENV} must be >= 0")
+    if explicit > 0:
+        return min(rows, explicit)
+
+    scratch_mib = envs.VLLM_DIFFUSION_GEMMA_ROW_CHUNK_SCRATCH_MIB
+    if scratch_mib <= 0:
+        raise ValueError(
+            f"{_DIFFUSION_GEMMA_ROW_CHUNK_SCRATCH_MIB_ENV} must be > 0"
+        )
+    scratch_bytes = scratch_mib * (1 << 20)
+    per_row = vocab_size * _DIFFUSION_GEMMA_ROW_CHUNK_BYTES_PER_ELEMENT
+    chunk = max(1, scratch_bytes // max(1, per_row))
+    if chunk >= _DIFFUSION_GEMMA_ROW_CHUNK_ALIGNMENT:
+        chunk = (
+            chunk
+            // _DIFFUSION_GEMMA_ROW_CHUNK_ALIGNMENT
+            * _DIFFUSION_GEMMA_ROW_CHUNK_ALIGNMENT
+        )
+    return max(1, min(rows, int(chunk)))
 
 
 class DiffusionGemmaSelfConditioning(nn.Module):
@@ -294,6 +386,45 @@ class DiffusionGemmaForConditionalGeneration(
         if text_config.tie_word_embeddings:
             self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
 
+        self.sampler_backend = _get_diffusion_gemma_sampler_backend()
+        self.use_row_chunked_sampler = self.sampler_backend != "materialized"
+        if (
+            self.use_row_chunked_sampler
+            and vllm_config.parallel_config.tensor_parallel_size != 1
+        ):
+            logger.warning_once(
+                "Disabling DiffusionGemma row-chunked sampler backend because "
+                "tensor_parallel_size=%d. TP row-chunked sampling needs a "
+                "global LSE/soft-embed merge and is not enabled in this "
+                "pressure-mode path.",
+                vllm_config.parallel_config.tensor_parallel_size,
+            )
+            self.sampler_backend = "materialized"
+            self.use_row_chunked_sampler = False
+        if (
+            self.use_row_chunked_sampler
+            and self.lm_head.weight.shape[0] != text_config.vocab_size
+        ):
+            logger.warning_once(
+                "Disabling DiffusionGemma row-chunked sampler backend because "
+                "the lm_head appears vocab-sharded (%d local rows vs %d global "
+                "vocab). TP row-chunked sampling needs a global LSE/soft-embed "
+                "merge and is not enabled in this pressure-mode path.",
+                self.lm_head.weight.shape[0],
+                text_config.vocab_size,
+            )
+            self.sampler_backend = "materialized"
+            self.use_row_chunked_sampler = False
+        if self.use_row_chunked_sampler:
+            logger.warning_once(
+                "DiffusionGemma row-chunked sampler backend is enabled "
+                "(%s=%s). This is a pressure-mode path for large decode "
+                "batches; logprobs and unsupported shapes fall back to the "
+                "materialized sampler.",
+                _DIFFUSION_GEMMA_SAMPLER_BACKEND_ENV,
+                self.sampler_backend,
+            )
+
         # HF DiffusionGemma applies the final-logit softcap in fp32, before
         # any other processing. Do it manually in `compute_logits` so the
         # LogitsProcessor only handles the lm_head GEMM.
@@ -382,6 +513,8 @@ class DiffusionGemmaForConditionalGeneration(
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        if self.use_row_chunked_sampler:
+            return hidden_states
         logits = self.logits_processor(self.lm_head, hidden_states)
         if logits is not None and self.final_logit_softcapping is not None:
             logits = _softcap_logits(logits, self.final_logit_softcapping)
@@ -696,6 +829,121 @@ def _compiled_sample_step(
     return scaled
 
 
+@torch.compile(dynamic=True)
+def _compiled_sample_step_from_row_chunked(
+    new_tokens: torch.Tensor,
+    argmax_tokens: torch.Tensor,
+    token_entropy: torch.Tensor,
+    soft_embeds: torch.Tensor,
+    decode_slots: torch.Tensor,
+    decode_idx: torch.Tensor,
+    all_slots: torch.Tensor,
+    valid_canvas_len: torch.Tensor,
+    canvas: torch.Tensor,
+    argmax_canvas: torch.Tensor,
+    step_tensor: torch.Tensor,
+    is_encoder_phase: torch.Tensor,
+    confident_tensor: torch.Tensor,
+    sc_embeds: torch.Tensor,
+    normalizer: torch.Tensor,
+    history: torch.Tensor,
+    history_len_tensor: torch.Tensor,
+    sampled: torch.Tensor,
+    num_sampled: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    max_denoising_steps: float,
+    confidence_threshold: float,
+    vocab_size: int,
+    CL: int,
+    ST: int,
+    entropy_bound: float,
+) -> torch.Tensor:
+    """Post-process row-chunked sampler outputs without full-vocab logits."""
+    num_decode = decode_slots.shape[0]
+    device = decode_slots.device
+
+    sampled.zero_()
+    num_sampled.zero_()
+
+    mean_entropy = token_entropy.mean(dim=-1)
+    confident_tensor[decode_slots] = mean_entropy < confidence_threshold
+
+    sorted_ent, sorted_idx = torch.sort(token_entropy, dim=-1)
+    cumsum_ent = torch.cumsum(sorted_ent, dim=-1)
+    cummax_ent = torch.cummax(sorted_ent, dim=-1).values
+    sorted_mask = (cumsum_ent - cummax_ent) <= entropy_bound
+    eb_mask = torch.zeros_like(sorted_mask)
+    eb_mask.scatter_(1, sorted_idx, sorted_mask)
+
+    is_commit = is_encoder_phase[decode_slots]
+    is_denoise = ~is_commit
+    cur_step = step_tensor[decode_slots].float()
+
+    new_step_val = torch.where(
+        is_denoise,
+        (cur_step + 1).to(step_tensor.dtype),
+        step_tensor.new_zeros(num_decode),
+    )
+    step_tensor[decode_slots] = new_step_val
+
+    random_tokens = torch.randint(
+        0, vocab_size, (num_decode, CL), device=device, dtype=canvas.dtype
+    )
+    denoise_canvas = torch.where(eb_mask, new_tokens, random_tokens)
+    canvas[decode_slots] = torch.where(
+        is_commit.unsqueeze(1), random_tokens, denoise_canvas
+    )
+
+    hist_len = history_len_tensor[decode_slots]
+    write_pos = hist_len % ST
+    for i in range(ST):
+        write_here = ((write_pos == i) & is_denoise).unsqueeze(1)
+        history[decode_slots, i] = torch.where(
+            write_here, argmax_tokens, history[decode_slots, i]
+        )
+
+    argmax_canvas[decode_slots] = torch.where(
+        is_denoise.unsqueeze(1), argmax_tokens, argmax_canvas[decode_slots]
+    )
+
+    new_hist_len = torch.where(is_denoise, hist_len + 1, hist_len.new_zeros(num_decode))
+    history_len_tensor[decode_slots] = new_hist_len
+
+    sampled[decode_idx] = argmax_canvas[decode_slots].to(
+        sampled.dtype
+    ) * is_commit.unsqueeze(1).to(sampled.dtype)
+    num_sampled[decode_idx] = is_commit.to(num_sampled.dtype) * valid_canvas_len.to(
+        num_sampled.dtype
+    )
+
+    ref = history[decode_slots, 0]
+    mismatch = torch.zeros(num_decode, device=device, dtype=torch.int32)
+    for h in range(1, ST):
+        mismatch = mismatch + (ref != history[decode_slots, h]).sum(dim=-1).int()
+    stable = mismatch == 0
+
+    step_after = step_tensor[decode_slots]
+    converged = (stable & confident_tensor[decode_slots] & (new_hist_len >= ST)) | (
+        step_after >= max_denoising_steps
+    )
+    is_encoder_phase[decode_slots] = torch.where(
+        is_commit, is_commit.new_zeros(num_decode), converged
+    )
+
+    sc_keep = (is_denoise & ~is_encoder_phase[decode_slots])[:, None, None]
+    sc_embeds[decode_slots] = (soft_embeds * normalizer * sc_keep).to(
+        sc_embeds.dtype
+    )
+
+    newly_converged = (converged & is_denoise).unsqueeze(1)
+    canvas[decode_slots] = torch.where(
+        newly_converged, argmax_canvas[decode_slots], canvas[decode_slots]
+    )
+    draft_tokens[all_slots, :CL] = canvas[all_slots]
+
+    return token_entropy.new_empty((0,))
+
+
 class DiffusionGemmaRequestStates:
     """Pre-allocated GPU tensors for DiffusionGemma per-request state.
 
@@ -928,7 +1176,11 @@ class DiffusionGemmaModelState(ModelState):
             entropy_bound=entropy_bound,
             confidence_threshold=gen["confidence_threshold"],
             embed_weight=self.model.model.embed_tokens.weight,
+            lm_head_weight=self.model.lm_head.weight,
+            final_logit_softcapping=self.model.final_logit_softcapping,
             normalizer=self.model.model.normalizer,
+            sampler_backend=self.model.sampler_backend,
+            use_row_chunked_sampler=self.model.use_row_chunked_sampler,
         ), None
 
     def apply_staged_writes(self) -> None:
@@ -1130,14 +1382,25 @@ class DiffusionSampler:
         t_max: float,
         entropy_bound: float,
         embed_weight: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        final_logit_softcapping: float | None,
         normalizer: torch.Tensor,
+        sampler_backend: str = "materialized",
+        use_row_chunked_sampler: bool = False,
     ):
         self.sampling_states = sampler.sampling_states
         self.req_states = sampler.req_states
         # Self-conditioning soft embed = probs @ embed_weight * normalizer,
         # computed in the sampler (see _compiled_sample_step).
         self.embed_weight = embed_weight
+        self.lm_head_weight = lm_head_weight
+        self.final_logit_softcapping = final_logit_softcapping
         self.normalizer = normalizer
+        self.sampler_backend = sampler_backend
+        self.use_row_chunked_sampler = use_row_chunked_sampler
+        self._row_chunked_sampler_logged = False
+        self._decode_batch_log_count = 0
+        self._stream_seed = 0
         self.canvas_length = (
             diffusion_config.canvas_length if diffusion_config is not None else 32
         )
@@ -1345,46 +1608,165 @@ class DiffusionSampler:
         # since it mutates is_encoder_phase (commit→False, converge→True).
         is_committing = states.is_encoder_phase[decode_slots].clone()
 
-        # --- Single compiled call: temp → sample → probs → post-process ---
-        scaled = _compiled_sample_step(
-            logits,
-            decode_slots,
-            decode_idx,
-            all_slots,
-            valid_canvas_len,
-            # State
-            states.canvas,
-            states.argmax_canvas,
-            states.step,
-            states.is_encoder_phase,
-            states.confident,
-            states.self_conditioning_embeds,
-            self.embed_weight,
-            self.normalizer,
-            states.accepted_canvas_history,
-            states.accepted_canvas_history_len,
-            # Output
-            sampled,
-            num_sampled,
-            self.req_states.draft_tokens,
-            # Config
-            max_denoising_steps=float(states.max_denoising_steps),
-            t_min=self.t_min,
-            t_max=self.t_max,
-            confidence_threshold=self.confidence_threshold,
-            vocab_size=self.vocab_size,
-            CL=self.canvas_length,
-            ST=states.stability_threshold,
-            entropy_bound=self.entropy_bound,
+        slots_np = input_batch.idx_mapping_np[:num_reqs]
+        max_num_logprobs = self.sampling_states.max_num_logprobs(slots_np)
+        is_sampler_warmup = _is_diffusion_gemma_sampler_warmup_batch(input_batch)
+        real_logprobs_enabled = max_num_logprobs >= 0 and not is_sampler_warmup
+        row_chunked_input = False
+        if self.use_row_chunked_sampler:
+            row_chunked_input = _is_diffusion_gemma_hidden_state_input(
+                logits, self.vocab_size, self.lm_head_weight.shape[1]
+            )
+        sampler_rows = num_decode * CL
+        effective_backend = _resolve_diffusion_gemma_sampler_backend_for_rows(
+            self.sampler_backend, sampler_rows
         )
 
+        use_row_chunked = (
+            row_chunked_input
+            and not real_logprobs_enabled
+            and self.final_logit_softcapping is not None
+            and effective_backend == "row_chunked"
+        )
+        if use_row_chunked:
+            row_chunk_size = _get_diffusion_gemma_row_chunk_size(
+                sampler_rows, self.vocab_size
+            )
+            if not self._row_chunked_sampler_logged:
+                logger.warning_once(
+                    "DiffusionGemma row-chunked sampler path is active "
+                    "(configured_backend=%s, effective_backend=%s, "
+                    "auto_max_materialized_rows=%d, row_chunk_env=%d, "
+                    "row_chunk_scratch_mib=%d).",
+                    self.sampler_backend,
+                    effective_backend,
+                    envs.VLLM_DIFFUSION_GEMMA_AUTO_MAX_MATERIALIZED_ROWS,
+                    envs.VLLM_DIFFUSION_GEMMA_ROW_CHUNK,
+                    envs.VLLM_DIFFUSION_GEMMA_ROW_CHUNK_SCRATCH_MIB,
+                )
+                self._row_chunked_sampler_logged = True
+            if (
+                envs.VLLM_DIFFUSION_GEMMA_LOG_DECODE_BATCH
+                and self._decode_batch_log_count < 64
+            ):
+                logger.warning(
+                    "DiffusionGemma row-chunked sampler batch: "
+                    "sampler_rows=%d resolved_row_chunk=%d.",
+                    sampler_rows,
+                    row_chunk_size,
+                )
+                self._decode_batch_log_count += 1
+
+            steps_f = states.step[decode_slots].float()
+            remaining = (float(states.max_denoising_steps) - steps_f).clamp(min=1.0)
+            temp = self.t_min + (self.t_max - self.t_min) * (
+                remaining / float(states.max_denoising_steps)
+            )
+            temperature = temp[:, None].expand(num_decode, CL).reshape(-1)
+            canvas_offsets = torch.arange(CL, device=device, dtype=torch.int64)
+            request_seeds = self.sampling_states.seeds.gpu[decode_slots].to(
+                torch.int64
+            )
+            step_offsets = states.step[decode_slots].to(torch.int64)
+            row_seed_offsets = (
+                (request_seeds[:, None] + (step_offsets[:, None] + 1) * 1_000_003)
+                * CL
+                + canvas_offsets[None, :]
+            ).reshape(-1)
+
+            _, token_entropy, new_tokens, argmax_tokens, soft_embeds = (
+                diffusion_gemma_softcap_row_chunked_sample_soft_embeds(
+                    logits,
+                    self.lm_head_weight[: self.vocab_size],
+                    self.embed_weight[: self.vocab_size],
+                    float(self.final_logit_softcapping),
+                    temperature,
+                    # Request seeds are already folded into row_seed_offsets.
+                    0,
+                    row_chunk_size=row_chunk_size,
+                    row_seed_offsets=row_seed_offsets,
+                    temperature_is_positive=min(self.t_min, self.t_max) > 0,
+                )
+            )
+            scaled = _compiled_sample_step_from_row_chunked(
+                new_tokens.view(num_decode, CL),
+                argmax_tokens.view(num_decode, CL),
+                token_entropy.view(num_decode, CL),
+                soft_embeds.view(num_decode, CL, -1),
+                decode_slots,
+                decode_idx,
+                all_slots,
+                valid_canvas_len,
+                states.canvas,
+                states.argmax_canvas,
+                states.step,
+                states.is_encoder_phase,
+                states.confident,
+                states.self_conditioning_embeds,
+                self.normalizer,
+                states.accepted_canvas_history,
+                states.accepted_canvas_history_len,
+                sampled,
+                num_sampled,
+                self.req_states.draft_tokens,
+                max_denoising_steps=float(states.max_denoising_steps),
+                confidence_threshold=self.confidence_threshold,
+                vocab_size=self.vocab_size,
+                CL=self.canvas_length,
+                ST=states.stability_threshold,
+                entropy_bound=self.entropy_bound,
+            )
+        else:
+            if row_chunked_input:
+                if effective_backend == "row_chunked" and real_logprobs_enabled:
+                    logger.warning_once(
+                        "DiffusionGemma row-chunked sampler requested but "
+                        "logprobs are enabled; falling back to materialized "
+                        "logits, which may need additional sampler memory "
+                        "reserve under high concurrency."
+                    )
+                logits = logits @ self.lm_head_weight[: self.vocab_size].t()
+                if self.final_logit_softcapping is not None:
+                    logits = _softcap_logits(logits, self.final_logit_softcapping)
+
+            # --- Single compiled call: temp → sample → probs → post-process ---
+            scaled = _compiled_sample_step(
+                logits,
+                decode_slots,
+                decode_idx,
+                all_slots,
+                valid_canvas_len,
+                # State
+                states.canvas,
+                states.argmax_canvas,
+                states.step,
+                states.is_encoder_phase,
+                states.confident,
+                states.self_conditioning_embeds,
+                self.embed_weight,
+                self.normalizer,
+                states.accepted_canvas_history,
+                states.accepted_canvas_history_len,
+                # Output
+                sampled,
+                num_sampled,
+                self.req_states.draft_tokens,
+                # Config
+                max_denoising_steps=float(states.max_denoising_steps),
+                t_min=self.t_min,
+                t_max=self.t_max,
+                confidence_threshold=self.confidence_threshold,
+                vocab_size=self.vocab_size,
+                CL=self.canvas_length,
+                ST=states.stability_threshold,
+                entropy_bound=self.entropy_bound,
+            )
+
         # --- Logprobs: stash on convergence, return on commit ---
-        slots_np = input_batch.idx_mapping_np[:num_reqs]
         is_decode_np = per_req_nlogits_np > 0
 
         logprobs_tensors = None
-        max_num_logprobs = self.sampling_states.max_num_logprobs(slots_np)
-        if max_num_logprobs >= 0:
+        if real_logprobs_enabled:
             # Denoise steps that just converged: the compiled step flipped
             # is_encoder_phase from False→True. Detect as slots where
             # is_encoder_phase is now True but is_committing was False.

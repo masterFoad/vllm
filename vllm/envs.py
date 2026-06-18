@@ -275,6 +275,12 @@ if TYPE_CHECKING:
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
     VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_MIB: str = ""
     VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_SCALE: float = 1.0
+    VLLM_DIFFUSION_GEMMA_SAMPLER_BACKEND: str = "materialized"
+    VLLM_DIFFUSION_GEMMA_AUTO_MAX_MATERIALIZED_ROWS: int = 2048
+    VLLM_DIFFUSION_GEMMA_ROW_CHUNK: int = 0
+    VLLM_DIFFUSION_GEMMA_ROW_CHUNK_SCRATCH_MIB: int = 1024
+    VLLM_DIFFUSION_GEMMA_ROW_CHUNK_FAST_FP32_RNG: bool = False
+    VLLM_DIFFUSION_GEMMA_LOG_DECODE_BATCH: bool = False
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
@@ -1907,6 +1913,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Optional multiplier for the DiffusionGemma sampler reserve auto estimate.
     "VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_SCALE": lambda: float(
         os.getenv("VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_SCALE", "1.0")
+    ),
+    # DiffusionGemma sampler backend. "materialized" keeps the default full
+    # logits path. "row_chunked" forces bounded row chunks. "auto" uses the
+    # materialized path for small decode batches and row chunks above
+    # VLLM_DIFFUSION_GEMMA_AUTO_MAX_MATERIALIZED_ROWS.
+    "VLLM_DIFFUSION_GEMMA_SAMPLER_BACKEND": lambda: os.getenv(
+        "VLLM_DIFFUSION_GEMMA_SAMPLER_BACKEND", "materialized"
+    ),
+    "VLLM_DIFFUSION_GEMMA_AUTO_MAX_MATERIALIZED_ROWS": lambda: int(
+        os.getenv("VLLM_DIFFUSION_GEMMA_AUTO_MAX_MATERIALIZED_ROWS", "2048")
+    ),
+    # Explicit row chunk. 0 means derive from the scratch budget below.
+    "VLLM_DIFFUSION_GEMMA_ROW_CHUNK": lambda: int(
+        os.getenv("VLLM_DIFFUSION_GEMMA_ROW_CHUNK", "0")
+    ),
+    # Scratch budget for the row-chunked sampler. The estimate intentionally
+    # over-counts Gumbel/noisy-argmax temporaries, not only score/prob tiles.
+    "VLLM_DIFFUSION_GEMMA_ROW_CHUNK_SCRATCH_MIB": lambda: int(
+        os.getenv("VLLM_DIFFUSION_GEMMA_ROW_CHUNK_SCRATCH_MIB", "1024")
+    ),
+    # Optional speed/compatibility tradeoff for the row-chunked sampler's
+    # stateless Gumbel RNG. Disabled by default so the helper preserves the
+    # original 53-bit mantissa -> fp64 scale -> fp32 stream exactly.
+    "VLLM_DIFFUSION_GEMMA_ROW_CHUNK_FAST_FP32_RNG": lambda: bool(
+        int(os.getenv("VLLM_DIFFUSION_GEMMA_ROW_CHUNK_FAST_FP32_RNG", "0"))
+    ),
+    "VLLM_DIFFUSION_GEMMA_LOG_DECODE_BATCH": lambda: bool(
+        int(os.getenv("VLLM_DIFFUSION_GEMMA_LOG_DECODE_BATCH", "0"))
     ),
     # NIXL EP environment variables
     "VLLM_NIXL_EP_MAX_NUM_RANKS": lambda: int(
