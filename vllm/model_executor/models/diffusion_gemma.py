@@ -26,6 +26,7 @@ from torch import nn
 from torch.nn import functional as F
 from transformers import AutoModel
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
@@ -61,6 +62,56 @@ from .interfaces import (
 )
 
 logger = init_logger(__name__)
+
+_DIFFUSION_GEMMA_SAMPLER_RESERVE_ENV = (
+    "VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_MIB"
+)
+_DIFFUSION_GEMMA_SAMPLER_RESERVE_SCALE_ENV = (
+    "VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_SCALE"
+)
+
+
+def _get_diffusion_gemma_sampler_memory_reserve_bytes(
+    reserve_spec: str,
+    reserve_scale: float,
+    *,
+    max_num_seqs: int,
+    max_num_batched_tokens: int,
+    canvas_length: int,
+    vocab_size: int,
+) -> int:
+    """Estimate extra KV-sizing reserve for DiffusionGemma sampler scratch."""
+    reserve_spec = reserve_spec.strip()
+    if not reserve_spec or reserve_spec == "0":
+        return 0
+
+    if reserve_spec.lower() != "auto":
+        try:
+            reserve_mib = int(reserve_spec)
+        except ValueError as err:
+            raise ValueError(
+                f"{_DIFFUSION_GEMMA_SAMPLER_RESERVE_ENV} must be >= 0 or 'auto'"
+            ) from err
+        if reserve_mib < 0:
+            raise ValueError(
+                f"{_DIFFUSION_GEMMA_SAMPLER_RESERVE_ENV} must be >= 0 or 'auto'"
+            )
+        return reserve_mib * (1 << 20)
+
+    if canvas_length <= 0:
+        raise ValueError("DiffusionGemma canvas_length must be positive")
+    if reserve_scale < 0:
+        raise ValueError(
+            f"{_DIFFUSION_GEMMA_SAMPLER_RESERVE_SCALE_ENV} must be >= 0"
+        )
+
+    max_decode_reqs = min(
+        int(max_num_seqs),
+        max(1, int(max_num_batched_tokens) // int(canvas_length)),
+    )
+    sampler_rows = max_decode_reqs * int(canvas_length)
+    # DiffusionGemma's materialized sampler scratch is fp32.
+    return int(sampler_rows * int(vocab_size) * 4 * reserve_scale)
 
 
 class DiffusionGemmaSelfConditioning(nn.Module):
@@ -829,6 +880,29 @@ class DiffusionGemmaModelState(ModelState):
 
     def get_supported_generation_tasks(self):
         return ("generate",)
+
+    def get_extra_non_kv_cache_memory_bytes(self) -> int:
+        reserve = _get_diffusion_gemma_sampler_memory_reserve_bytes(
+            envs.VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_MIB,
+            envs.VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_SCALE,
+            max_num_seqs=self.max_num_reqs,
+            max_num_batched_tokens=self.max_num_tokens,
+            canvas_length=self.diffusion_states.canvas_length,
+            # LogitsProcessor all-gathers vocab-parallel logits before the
+            # materialized sampler, so reserve global-vocab scratch.
+            vocab_size=self.model_config.get_vocab_size(),
+        )
+        if reserve > 0:
+            logger.info_once(
+                "DiffusionGemma sampler memory reserve: %s GiB "
+                "(%s=%s, %s=%s)",
+                reserve / (1 << 30),
+                _DIFFUSION_GEMMA_SAMPLER_RESERVE_ENV,
+                envs.VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_MIB,
+                _DIFFUSION_GEMMA_SAMPLER_RESERVE_SCALE_ENV,
+                envs.VLLM_DIFFUSION_GEMMA_SAMPLER_MEMORY_RESERVE_SCALE,
+            )
+        return reserve
 
     def custom_sampler(self, sampler: Any) -> tuple[Any, Any] | None:
         diffusion_config = self.vllm_config.diffusion_config
