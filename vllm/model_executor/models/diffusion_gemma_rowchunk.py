@@ -17,9 +17,9 @@ _INT64_MIX_C = -7723592293110705685
 _INT64_MASK_53 = (1 << 53) - 1
 _FLOAT_2_NEG_53 = 1.0 / float(1 << 53)
 # Keep the Gumbel tile small enough for the opt-in rowchunk memory-pressure
-# path. For DiffusionGemma's 262k vocab this makes the throwaway Gumbel tile
-# about 4 MiB per 64 rows, at the cost of extra loop/GPU-launch overhead.
-_GUMBEL_VOCAB_CHUNK_SIZE = 16_384
+# path while avoiding excessive per-tile launch overhead. For DiffusionGemma's
+# 262k vocab this makes the throwaway Gumbel tile about 8 MiB per 64 rows.
+_GUMBEL_VOCAB_CHUNK_SIZE = 32_768
 
 
 def _uniform_from_mantissa(mantissa: torch.Tensor) -> torch.Tensor:
@@ -46,11 +46,22 @@ def stable_uniform_from_indices(
         + (row_offsets[:, None].to(torch.int64) + 1) * _INT64_MIX_A
         + int(seed)
     )
+    return _stable_uniform_from_mixed_int64(x)
+
+
+def _stable_uniform_from_mixed_int64(x: torch.Tensor) -> torch.Tensor:
     x = (x ^ (x >> 30)) * _INT64_MIX_B
     x = (x ^ (x >> 27)) * _INT64_MIX_C
     x = x ^ (x >> 31)
     mantissa = torch.bitwise_and(x, _INT64_MASK_53)
     return _uniform_from_mantissa(mantissa)
+
+
+def _stable_uniform_from_row_base(
+    row_base: torch.Tensor,
+    token_offsets: torch.Tensor,
+) -> torch.Tensor:
+    return _stable_uniform_from_mixed_int64(token_offsets[None, :] + row_base)
 
 
 def _stable_gumbel_argmax_from_scaled(
@@ -99,16 +110,18 @@ def _stable_gumbel_argmax_from_scaled(
         dtype=torch.float32,
     )
     best_tokens = torch.zeros((rows,), device=scaled.device, dtype=torch.int64)
+    row_base = (row_offsets[:, None] + 1) * _INT64_MIX_A + int(seed)
+    uniform_min = torch.finfo(torch.float32).tiny
+    uniform_max = 1.0 - torch.finfo(torch.float32).eps
     for vocab_start in range(0, vocab, gumbel_vocab_chunk_size):
         vocab_end = min(vocab_start + gumbel_vocab_chunk_size, vocab)
-        uniform = stable_uniform_from_indices(
-            row_offsets,
+        uniform = _stable_uniform_from_row_base(
+            row_base,
             token_offsets[vocab_start:vocab_end],
-            seed,
         )
         uniform.clamp_(
-            min=torch.finfo(uniform.dtype).tiny,
-            max=1.0 - torch.finfo(uniform.dtype).eps,
+            min=uniform_min,
+            max=uniform_max,
         )
         # In-place Gumbel transform on the throwaway uniform tile:
         # uniform = -log(-log(uniform)).

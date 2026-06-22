@@ -16,7 +16,9 @@ from vllm.model_executor.models.diffusion_gemma import (
     _should_use_diffusion_gemma_row_chunked_sampler,
 )
 from vllm.model_executor.models.diffusion_gemma_rowchunk import (
+    _INT64_MIX_A,
     _stable_gumbel_argmax_from_scaled,
+    _stable_uniform_from_row_base,
     diffusion_gemma_softcap_row_chunked_sample_soft_embeds,
     stable_uniform_from_indices,
 )
@@ -213,6 +215,19 @@ def test_stable_uniform_matches_legacy_float64_stream():
 
     actual = stable_uniform_from_indices(rows, tokens, seed=2026061807)
     expected = _legacy_stable_uniform_from_indices(rows, tokens, seed=2026061807)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_stable_uniform_row_base_matches_inline_stream():
+    rows = torch.tensor([0, 1_000_003, 17_000_051], device="cuda", dtype=torch.int64)
+    tokens = torch.arange(32769, device="cuda", dtype=torch.int64)
+    seed = 2026062235
+    row_base = (rows[:, None] + 1) * _INT64_MIX_A + seed
+
+    actual = _stable_uniform_from_row_base(row_base, tokens)
+    expected = stable_uniform_from_indices(rows, tokens, seed=seed)
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
