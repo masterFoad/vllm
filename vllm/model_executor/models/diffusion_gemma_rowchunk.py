@@ -16,6 +16,10 @@ _INT64_MIX_B = -4658895280553007687
 _INT64_MIX_C = -7723592293110705685
 _INT64_MASK_53 = (1 << 53) - 1
 _FLOAT_2_NEG_53 = 1.0 / float(1 << 53)
+# Keep the Gumbel tile small enough for the opt-in rowchunk memory-pressure
+# path. For DiffusionGemma's 262k vocab this makes the throwaway Gumbel tile
+# about 4 MiB per 64 rows, at the cost of extra loop/GPU-launch overhead.
+_GUMBEL_VOCAB_CHUNK_SIZE = 16_384
 
 
 def _uniform_from_mantissa(mantissa: torch.Tensor) -> torch.Tensor:
@@ -49,6 +53,88 @@ def stable_uniform_from_indices(
     return _uniform_from_mantissa(mantissa)
 
 
+def _stable_gumbel_argmax_from_scaled(
+    scaled: torch.Tensor,
+    row_offsets: torch.Tensor,
+    token_offsets: torch.Tensor,
+    seed: int,
+    noise_scale: float | torch.Tensor,
+    *,
+    gumbel_vocab_chunk_size: int = _GUMBEL_VOCAB_CHUNK_SIZE,
+) -> torch.Tensor:
+    """Sample argmax over vocab without materializing full-vocab noise.
+
+    ``scaled`` is expected to be the fp32 softcapped/temperature-scaled scores
+    produced by ``diffusion_gemma_softcap_row_chunked_sample_soft_embeds``.
+    Ties are resolved like ``torch.argmax`` over the full vocab row: the lowest
+    token id wins. If NaNs leak into a row, the first NaN wins, matching
+    ``torch.max``/``torch.argmax`` behavior.
+    """
+    if gumbel_vocab_chunk_size <= 0:
+        raise ValueError("gumbel_vocab_chunk_size must be positive")
+    if scaled.ndim != 2:
+        raise ValueError("scaled must be rank-2")
+    if scaled.dtype != torch.float32:
+        raise ValueError("scaled must be float32")
+    rows, vocab = scaled.shape
+    if row_offsets.ndim != 1 or row_offsets.shape[0] != rows:
+        raise ValueError("row_offsets must have shape [rows]")
+    if token_offsets.ndim != 1 or token_offsets.shape[0] != vocab:
+        raise ValueError("token_offsets must have shape [vocab]")
+    if row_offsets.device != scaled.device or token_offsets.device != scaled.device:
+        raise ValueError("offset tensors must be on the same device as scaled")
+    if row_offsets.dtype != torch.int64 or token_offsets.dtype != torch.int64:
+        raise ValueError("offset tensors must be int64")
+    if isinstance(noise_scale, torch.Tensor):
+        if noise_scale.shape != (rows, 1):
+            raise ValueError("noise_scale tensor must have shape [rows, 1]")
+        if noise_scale.device != scaled.device:
+            raise ValueError("noise_scale tensor must be on the same device as scaled")
+        if noise_scale.dtype != torch.float32:
+            raise ValueError("noise_scale tensor must be float32")
+    best_values = torch.full(
+        (rows,),
+        float("-inf"),
+        device=scaled.device,
+        dtype=torch.float32,
+    )
+    best_tokens = torch.zeros((rows,), device=scaled.device, dtype=torch.int64)
+    for vocab_start in range(0, vocab, gumbel_vocab_chunk_size):
+        vocab_end = min(vocab_start + gumbel_vocab_chunk_size, vocab)
+        uniform = stable_uniform_from_indices(
+            row_offsets,
+            token_offsets[vocab_start:vocab_end],
+            seed,
+        )
+        uniform.clamp_(
+            min=torch.finfo(uniform.dtype).tiny,
+            max=1.0 - torch.finfo(uniform.dtype).eps,
+        )
+        # In-place Gumbel transform on the throwaway uniform tile:
+        # uniform = -log(-log(uniform)).
+        uniform.log_()
+        uniform.neg_()
+        uniform.log_()
+        uniform.neg_()
+        if isinstance(noise_scale, torch.Tensor):
+            uniform.mul_(noise_scale)
+        elif float(noise_scale) != 1.0:
+            uniform.mul_(float(noise_scale))
+        uniform.add_(scaled[:, vocab_start:vocab_end])
+        block_values, block_tokens = uniform.max(dim=-1)
+        block_tokens = block_tokens + vocab_start
+        # Full-tensor argmax returns the first max. Since vocab blocks are visited
+        # in order, update only on a strict improvement to preserve tie behavior.
+        # torch.max treats NaN as the row maximum. Preserve that behavior by
+        # updating to the first NaN block, then keeping that first NaN index.
+        update = (block_values > best_values) | (
+            torch.isnan(block_values) & ~torch.isnan(best_values)
+        )
+        best_values = torch.where(update, block_values, best_values)
+        best_tokens = torch.where(update, block_tokens, best_tokens)
+    return best_tokens
+
+
 def diffusion_gemma_softcap_row_chunked_sample_soft_embeds(
     hidden: torch.Tensor,
     weight: torch.Tensor,
@@ -61,6 +147,7 @@ def diffusion_gemma_softcap_row_chunked_sample_soft_embeds(
     row_seed_offsets: torch.Tensor | None = None,
     token_offsets: torch.Tensor | None = None,
     temperature_is_positive: bool = False,
+    gumbel_vocab_chunk_size: int = _GUMBEL_VOCAB_CHUNK_SIZE,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Row-chunked DiffusionGemma sampler using bounded materialized tiles.
 
@@ -71,6 +158,9 @@ def diffusion_gemma_softcap_row_chunked_sample_soft_embeds(
     not sample-stream identical to the default materialized sampler RNG.
     ``token_offsets`` is an optional precomputed ``torch.arange(vocab)`` for
     callers that reuse the helper every decode step.
+    ``gumbel_vocab_chunk_size`` bounds the throwaway Gumbel/noisy argmax tile
+    inside the already opt-in rowchunk memory-pressure path. Smaller values use
+    less scratch and more loop overhead; this is not a throughput knob.
     ``temperature_is_positive`` is a caller-provided precondition for tensor
     temperatures: set it only when every row temperature is strictly positive.
     It skips zero-temperature greedy handling to avoid a per-chunk CUDA sync.
@@ -92,6 +182,8 @@ def diffusion_gemma_softcap_row_chunked_sample_soft_embeds(
         raise ValueError("softcap must be positive")
     if row_chunk_size <= 0:
         raise ValueError("row_chunk_size must be positive")
+    if gumbel_vocab_chunk_size <= 0:
+        raise ValueError("gumbel_vocab_chunk_size must be positive")
 
     if isinstance(temperature, torch.Tensor):
         if temperature.ndim != 1 or temperature.shape[0] != hidden.shape[0]:
@@ -201,26 +293,14 @@ def diffusion_gemma_softcap_row_chunked_sample_soft_embeds(
         if skip_gumbel:
             sample = greedy
         else:
-            uniform = stable_uniform_from_indices(
-                row_seed_offsets[row_start:row_end], token_offsets, seed
+            sample = _stable_gumbel_argmax_from_scaled(
+                scaled,
+                row_seed_offsets[row_start:row_end],
+                token_offsets,
+                seed,
+                noise_scale,
+                gumbel_vocab_chunk_size=gumbel_vocab_chunk_size,
             )
-            uniform.clamp_(
-                min=torch.finfo(uniform.dtype).tiny,
-                max=1.0 - torch.finfo(uniform.dtype).eps,
-            )
-            # In-place Gumbel transform on the throwaway uniform tile:
-            # uniform = -log(-log(uniform)).
-            uniform.log_()
-            uniform.neg_()
-            uniform.log_()
-            uniform.neg_()
-            if isinstance(noise_scale, torch.Tensor):
-                uniform.mul_(noise_scale)
-            # ``scaled`` is a chunk-local temporary. LSE, entropy, greedy, and
-            # soft embeddings have already been computed, so reuse it for the
-            # noisy argmax instead of allocating another full-vocab tile.
-            scaled.add_(uniform)
-            sample = scaled.argmax(dim=-1)
 
         if has_zero_temp:
             assert zero_temp_rows is not None
